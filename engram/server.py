@@ -1013,6 +1013,236 @@ def engram_workspace_status() -> str:
 
 
 # ===========================================================================
+# Code-First Tools (Phase 4 pivot)
+# ===========================================================================
+
+
+@mcp.tool()
+@_safe_json
+def engram_architecture_decision(
+    context: str,
+    options: str,
+    decision: str,
+    consequences: str = "",
+) -> str:
+    """Record an Architecture Decision Record (ADR) into persistent memory.
+
+    ADRs capture significant design choices with their rationale and
+    alternatives.  They are assigned high initial salience so they are
+    always present in the context window during relevant tasks, preventing
+    the agent from violating long-term project policies.
+
+    Uses the Michael Nygard ADR format: Context, Options, Decision,
+    Consequences.
+
+    Args:
+        context: Why is this decision being made? What forces are at play?
+        options: What alternatives were considered? (comma-separated or prose)
+        decision: What was decided and why?
+        consequences: What are the trade-offs? (optional)
+    """
+    system = _get_system()
+
+    adr_content = (
+        f"## Architecture Decision\n\n"
+        f"### Context\n{context}\n\n"
+        f"### Options Considered\n{options}\n\n"
+        f"### Decision\n{decision}\n\n"
+    )
+    if consequences:
+        adr_content += f"### Consequences\n{consequences}\n"
+
+    trace_id = system.episodic.log_trace(
+        content=adr_content,
+        kind="architecture_decision",
+        tags=["adr"],
+        salience=0.95,  # High salience — always surfaced at boot
+    )
+    return json.dumps(
+        {
+            "trace_id": trace_id,
+            "kind": "architecture_decision",
+            "salience": 0.95,
+            "message": "ADR recorded with high salience — will be surfaced at boot.",
+        }
+    )
+
+
+@mcp.tool()
+@_safe_json
+def engram_code_pattern(
+    action: str,
+    name: str,
+    content: str = "",
+    tags: str = "",
+    language: str = "",
+) -> str:
+    """Store or retrieve validated code patterns in procedural memory.
+
+    Code patterns are reusable implementation templates that the agent
+    can adapt to different contexts.  Patterns are stored as procedural
+    skills and also logged as episodic traces for retrieval.
+
+    Args:
+        action: "store" to save a pattern, "get" to retrieve one.
+        name: Pattern name (e.g., "retry-with-backoff", "repository-pattern").
+        content: The pattern code/description (required for "store").
+        tags: Comma-separated tags for categorization (e.g., "python,async,error-handling").
+        language: Programming language (e.g., "python", "typescript").
+    """
+    system = _get_system()
+
+    if action == "store":
+        if not content:
+            return json.dumps({"error": "content is required for action='store'"})
+
+        # Store as procedural skill
+        header = f"# {name}\n"
+        if language:
+            header += f"Language: {language}\n"
+        if tags:
+            header += f"Tags: {tags}\n"
+        header += "\n"
+        system.procedural.add_skill(name, header + content)
+
+        # Also log as episodic trace for search/retrieval
+        tag_list = [t.strip() for t in tags.split(",") if t.strip()]
+        if language:
+            tag_list.append(language)
+        trace_id = system.episodic.log_trace(
+            content=f"[Code Pattern: {name}] {content[:500]}",
+            kind="code_pattern",
+            tags=tag_list,
+            salience=0.8,
+        )
+
+        return json.dumps(
+            {
+                "action": "store",
+                "name": name,
+                "trace_id": trace_id,
+                "message": f"Pattern '{name}' stored in procedural + episodic memory.",
+            }
+        )
+
+    elif action == "get":
+        skill_content = system.procedural.get_skill(name)
+        if skill_content:
+            return json.dumps(
+                {
+                    "action": "get",
+                    "name": name,
+                    "content": skill_content,
+                }
+            )
+        else:
+            return json.dumps(
+                {
+                    "action": "get",
+                    "name": name,
+                    "content": None,
+                    "message": f"Pattern '{name}' not found.",
+                }
+            )
+
+    else:
+        return json.dumps(
+            {"error": f"Unknown action '{action}'. Use 'store' or 'get'."}
+        )
+
+
+@mcp.tool()
+@_safe_json
+def engram_debug_log(
+    error_message: str,
+    resolution: str,
+    stack_trace: str = "",
+    error_category: str = "logic",
+) -> str:
+    """Record a debugging episode with error and resolution.
+
+    Captures the error context and successful fix, enabling the agent
+    to recall resolution strategies for similar future failures.
+    Error fingerprinting groups semantically similar issues.
+
+    Args:
+        error_message: The error message or description of the problem.
+        resolution: How the error was resolved (description + key changes).
+        stack_trace: The stack trace (optional, for richer context).
+        error_category: One of: logic, integration, performance, security, configuration.
+    """
+    system = _get_system()
+
+    valid_categories = {
+        "logic",
+        "integration",
+        "performance",
+        "security",
+        "configuration",
+    }
+    if error_category not in valid_categories:
+        error_category = "logic"
+
+    debug_content = (
+        f"## Debug Session: {error_category}\n\n### Error\n{error_message}\n\n"
+    )
+    if stack_trace:
+        debug_content += f"### Stack Trace\n```\n{stack_trace}\n```\n\n"
+    debug_content += f"### Resolution\n{resolution}\n"
+
+    trace_id = system.episodic.log_trace(
+        content=debug_content,
+        kind="debug_session",
+        tags=["debug", error_category],
+        salience=0.75,
+    )
+    return json.dumps(
+        {
+            "trace_id": trace_id,
+            "kind": "debug_session",
+            "error_category": error_category,
+            "message": "Debug session logged — will be recalled for similar errors.",
+        }
+    )
+
+
+@mcp.tool()
+@_safe_json
+def engram_get_rules(file_path: str = "") -> str:
+    """Retrieve coding standards and style rules for the current project.
+
+    Returns the project's coding philosophy (from SOUL.md), forbidden
+    constructs, review checklist, and any relevant procedural patterns.
+    Optionally scoped to a specific file path for directory-aware rules.
+
+    Args:
+        file_path: Optional file path to scope rules to (for future
+                   per-directory rule support).
+    """
+    system = _get_system()
+
+    # Load SOUL.md (coding philosophy / standards)
+    soul_text = system.semantic.get_identity()
+
+    # Load preferences (which include coding style preferences)
+    prefs = system.semantic.get_preferences()
+
+    # Load any style-related procedural skills
+    style_skills = system.procedural.search_skills("coding style convention standard")
+
+    result = {
+        "coding_philosophy": soul_text[:2000] if soul_text else "",
+        "preferences": prefs[:500] if prefs else "",
+        "style_skills": style_skills[:5] if style_skills else [],
+    }
+
+    if file_path:
+        result["scoped_to"] = file_path
+
+    return json.dumps(result, indent=2)
+
+
+# ===========================================================================
 # Maintenance Tools
 # ===========================================================================
 
