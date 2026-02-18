@@ -1,18 +1,29 @@
 """
 engram.search.semantic — Semantic (vector) search using ChromaDB.
 
-Provides RAG-style retrieval across all four memory layers:
-soul (identity), episodic (traces), semantic (relationships/facts),
-and procedural (skills).
+Provides RAG-style retrieval across memory layers with dual-embedding
+support: natural language content uses a general-purpose NL model,
+while code content is additionally indexed with a code-specific model
+in a dedicated collection.
+
+Collections:
+  - soul:       Identity paragraphs (SOUL.md)
+  - episodic:   Episodic traces (all types, NL embeddings)
+  - semantic:   Relationships, facts
+  - procedural: Skills, patterns
+  - code:       Code-specific content (code embeddings) — optional,
+                only created when a code_embedding_func is provided.
 
 If an ``embedding_func`` is provided (e.g. an Ollama embeddings
-wrapper), it is used for all collections.  Otherwise ChromaDB's
-built-in default embedding function handles it.
+wrapper), it is used for the NL collections.  The ``code_embedding_func``
+(e.g. jina-embeddings-v2-base-code via sentence-transformers) is used
+exclusively for the code collection.
 """
 
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
@@ -20,18 +31,39 @@ from typing import Callable, Dict, List, Optional
 import chromadb
 from chromadb.config import Settings
 
+log = logging.getLogger(__name__)
 
-# The four collection names, one per memory layer.
-COLLECTIONS = ("soul", "episodic", "semantic", "procedural")
+
+# NL collections — always created.
+NL_COLLECTIONS = ("soul", "episodic", "semantic", "procedural")
+
+# Code collection name — only created when code embeddings are available.
+CODE_COLLECTION = "code"
 
 
 class SemanticSearch:
-    """ChromaDB-backed vector search across all memory layers."""
+    """ChromaDB-backed vector search with dual-embedding support.
+
+    Parameters
+    ----------
+    embeddings_dir:
+        Directory for ChromaDB persistent storage.
+    embedding_func:
+        NL embedding callable ``(text: str) -> list[float]``.
+        Used for soul, episodic, semantic, procedural collections.
+        If None, ChromaDB's built-in default is used.
+    code_embedding_func:
+        Code embedding callable ``(text: str) -> list[float]``.
+        Used exclusively for the code collection.
+        If None, the code collection is not created and code
+        content is only indexed in the episodic (NL) collection.
+    """
 
     def __init__(
         self,
         embeddings_dir: Path,
         embedding_func: Optional[Callable] = None,
+        code_embedding_func: Optional[Callable] = None,
     ) -> None:
         self.embeddings_dir = Path(embeddings_dir)
         self.embeddings_dir.mkdir(parents=True, exist_ok=True)
@@ -41,17 +73,20 @@ class SemanticSearch:
             settings=Settings(anonymized_telemetry=False),
         )
 
-        # Wrap a user-supplied embedding callable into the ChromaDB
-        # EmbeddingFunction protocol if provided.
+        # Wrap user-supplied embedding callables into ChromaDB protocol.
         self._ef: Optional[chromadb.EmbeddingFunction] = None
         if embedding_func is not None:
             self._ef = _WrappedEmbeddingFunction(embedding_func)
 
-        # Pre-create / get all collections.
+        self._code_ef: Optional[chromadb.EmbeddingFunction] = None
+        if code_embedding_func is not None:
+            self._code_ef = _WrappedEmbeddingFunction(code_embedding_func)
+
+        # Pre-create / get NL collections.
         # IMPORTANT: use cosine distance so that distances are in [0, 2]
         # and the merge logic in unified.py can normalise correctly.
         self._collections: Dict[str, chromadb.Collection] = {}
-        for name in COLLECTIONS:
+        for name in NL_COLLECTIONS:
             kwargs: Dict = {
                 "name": name,
                 "metadata": {"hnsw:space": "cosine"},
@@ -59,6 +94,32 @@ class SemanticSearch:
             if self._ef is not None:
                 kwargs["embedding_function"] = self._ef
             self._collections[name] = self._client.get_or_create_collection(**kwargs)
+
+        # Create code collection only if code embeddings are available.
+        self._has_code_collection = False
+        if self._code_ef is not None:
+            try:
+                self._collections[CODE_COLLECTION] = (
+                    self._client.get_or_create_collection(
+                        name=CODE_COLLECTION,
+                        metadata={"hnsw:space": "cosine"},
+                        embedding_function=self._code_ef,
+                    )
+                )
+                self._has_code_collection = True
+                log.info("Code embedding collection created/loaded")
+            except Exception as exc:
+                log.warning("Failed to create code collection: %s", exc)
+
+    @property
+    def has_code_embeddings(self) -> bool:
+        """True if the code collection is available for dual-embedding."""
+        return self._has_code_collection
+
+    @property
+    def collection_names(self) -> List[str]:
+        """All active collection names."""
+        return list(self._collections.keys())
 
     # ------------------------------------------------------------------
     # Indexing
@@ -108,7 +169,7 @@ class SemanticSearch:
         )
 
     def index_trace(self, trace_id: str, content: str, metadata: Dict) -> None:
-        """Index an episodic trace."""
+        """Index an episodic trace (NL embeddings)."""
         safe_meta = self._sanitise_metadata(metadata)
         safe_meta["type"] = "trace"
         safe_meta["trace_id"] = trace_id
@@ -118,6 +179,50 @@ class SemanticSearch:
             collection="episodic",
             doc_id=f"trace_{trace_id}",
         )
+
+    def index_code(
+        self,
+        doc_id: str,
+        content: str,
+        metadata: Dict,
+    ) -> bool:
+        """Index content in the code collection (code embeddings).
+
+        This is used for dual-indexing: code content is indexed in
+        both the episodic (NL) collection via ``index_trace()`` and
+        the code collection via this method.
+
+        Parameters
+        ----------
+        doc_id:
+            Unique document ID (typically "code_{trace_id}").
+        content:
+            The code content to index.
+        metadata:
+            Metadata dict (trace_id, kind, tags, etc.).
+
+        Returns
+        -------
+        bool
+            True if indexed successfully, False if code collection
+            is not available.
+        """
+        if not self._has_code_collection:
+            return False
+
+        safe_meta = self._sanitise_metadata(metadata)
+        safe_meta["type"] = "code"
+        try:
+            self.index_text(
+                text=content,
+                metadata=safe_meta,
+                collection=CODE_COLLECTION,
+                doc_id=doc_id,
+            )
+            return True
+        except Exception as exc:
+            log.warning("Failed to index code content: %s", exc)
+            return False
 
     def index_skill(self, skill_name: str, content: str) -> None:
         """Index a procedural skill."""
@@ -147,7 +252,8 @@ class SemanticSearch:
         query:
             Natural language search query.
         collections:
-            Which collections to search (default: all).
+            Which collections to search (default: all active, including
+            code collection if available).
         n_results:
             Max results per collection.
         where:
@@ -160,7 +266,8 @@ class SemanticSearch:
             ``metadata``, and ``distance``.  Sorted by distance
             (ascending — lower is closer).
         """
-        target_collections = collections or list(COLLECTIONS)
+        # Default: search ALL active collections (including code)
+        target_collections = collections or list(self._collections.keys())
         all_results: List[Dict] = []
 
         for col_name in target_collections:
@@ -264,6 +371,7 @@ class SemanticSearch:
         # PersistentClient doesn't have an explicit close, but we
         # clear references so the GC can collect promptly.
         self._collections.clear()
+        self._has_code_collection = False
         self._client = None  # type: ignore[assignment]
 
     # ------------------------------------------------------------------
@@ -306,7 +414,7 @@ class SemanticSearch:
         dict
             Counts of indexed documents per collection.
         """
-        counts: Dict[str, int] = {c: 0 for c in COLLECTIONS}
+        counts: Dict[str, int] = {c: 0 for c in self._collections}
 
         # -- Soul / identity -----------------------------------------------
         soul_text = ""
@@ -343,6 +451,9 @@ class SemanticSearch:
             counts["semantic"] += 1
 
         # -- Episodic traces -----------------------------------------------
+        # Import here to avoid circular dependency
+        from engram.search.code_embeddings import is_code_content
+
         if hasattr(episodic_store, "get_traces"):
             traces = episodic_store.get_traces(limit=10000)
             for trace in traces:
@@ -355,8 +466,20 @@ class SemanticSearch:
                         if k not in ("content",)
                         and isinstance(v, (str, int, float, bool))
                     }
+                    # Always index in episodic (NL embeddings)
                     self.index_trace(trace_id, content, meta)
                     counts["episodic"] += 1
+
+                    # Dual-index code content in code collection
+                    kind = trace.get("kind", "")
+                    if self._has_code_collection and is_code_content(
+                        trace_kind=kind, content=content
+                    ):
+                        code_meta = dict(meta)
+                        code_meta["trace_id"] = trace_id
+                        if self.index_code(f"code_{trace_id}", content, code_meta):
+                            counts.setdefault(CODE_COLLECTION, 0)
+                            counts[CODE_COLLECTION] += 1
 
         # -- Procedural skills ---------------------------------------------
         if hasattr(procedural_store, "list_skills") and hasattr(
@@ -378,7 +501,8 @@ class SemanticSearch:
     def _get_collection(self, name: str) -> chromadb.Collection:
         if name not in self._collections:
             raise ValueError(
-                f"Unknown collection {name!r}; expected one of {list(COLLECTIONS)}"
+                f"Unknown collection {name!r}; "
+                f"expected one of {list(self._collections.keys())}"
             )
         return self._collections[name]
 

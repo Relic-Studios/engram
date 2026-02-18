@@ -437,6 +437,7 @@ class MemoryStats:
     total_messages: int = 0
     avg_salience: float = 0.0
     memory_pressure: float = 0.0
+    code_embeddings_active: bool = False
     status: str = ""
 
     def __post_init__(self) -> None:
@@ -464,5 +465,6 @@ class MemoryStats:
             "total_memories": self.total_memories,
             "avg_salience": round(self.avg_salience, 4),
             "memory_pressure": round(self.memory_pressure, 4),
+            "code_embeddings_active": self.code_embeddings_active,
             "status": self.status,
         }

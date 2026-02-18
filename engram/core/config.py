@@ -101,6 +101,20 @@ class Config:
     # Set to "" to fall back to ChromaDB's built-in default.
     embedding_model: str = "nomic-embed-text"
 
+    # -- code-specific embedding model -------------------------------------
+    # Dual-embedding space: NL content uses embedding_model (above),
+    # code content uses code_embedding_model (below).
+    #
+    # The code model is loaded via sentence-transformers (not Ollama)
+    # and handles function signatures, imports, stack traces, etc.
+    #
+    # Default: "jinaai/jina-embeddings-v2-base-code" — 768d, 8192 tokens,
+    #          trained on GitHub + StackOverflow code-NL pairs.
+    #          Requires: pip install sentence-transformers
+    # Set to "" to disable code embeddings (NL-only mode).
+    code_embedding_model: str = "jinaai/jina-embeddings-v2-base-code"
+    code_embedding_device: str = ""  # "" = auto-detect (CUDA if available)
+
     # -- cross-encoder reranking -------------------------------------------
     # When enabled, search results are rescored by a cross-encoder after
     # RRF merge.  This is the #1 RAG optimization (~15-30% precision gain)
@@ -456,6 +470,30 @@ class Config:
         # Other providers could be added here (OpenAI embeddings, etc.)
         return None
 
+    def get_code_embedding_func(self) -> Optional[Callable]:
+        """Return a code-specific embedding callable, or None.
+
+        Uses sentence-transformers to load the configured code embedding
+        model.  The model is loaded lazily on first call.
+
+        When ``code_embedding_model`` is empty, returns None (code
+        content will only use NL embeddings).
+
+        Returns
+        -------
+        callable or None
+            ``(text: str) -> list[float]`` for code embeddings, or None.
+        """
+        if not self.code_embedding_model:
+            return None
+
+        from engram.search.code_embeddings import build_code_embedding_func
+
+        return build_code_embedding_func(
+            model_name=self.code_embedding_model,
+            device=self.code_embedding_device,
+        )
+
     def _build_ollama_embedding_func(self) -> Callable:
         """Build an embedding function targeting Ollama /api/embeddings."""
         try:
@@ -530,6 +568,8 @@ class Config:
             "boot_n_decisions": self.boot_n_decisions,
             # retrieval
             "embedding_model": self.embedding_model,
+            "code_embedding_model": self.code_embedding_model,
+            "code_embedding_device": self.code_embedding_device,
             "reranker_enabled": self.reranker_enabled,
             "reranker_model": self.reranker_model,
             "reranker_device": self.reranker_device,

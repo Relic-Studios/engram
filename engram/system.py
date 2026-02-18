@@ -115,6 +115,16 @@ class MemorySystem:
             except Exception as exc:
                 log.warning("Failed to build embedding function: %s", exc)
                 self._embedding_func = None
+
+        # Code-specific embedding function (dual-embedding space).
+        # Built lazily from config.  If unavailable, code content
+        # is only indexed with NL embeddings (graceful degradation).
+        self._code_embedding_func = None
+        try:
+            self._code_embedding_func = self.config.get_code_embedding_func()
+        except Exception as exc:
+            log.info("Code embeddings not available: %s", exc)
+
         # Defer semantic search init (ChromaDB) until first use
         # since it's optional and heavyweight.
         self._unified_search = None
@@ -184,6 +194,9 @@ class MemorySystem:
         Called by ``EpisodicStore.log_trace()`` via the
         ``_on_trace_logged`` callback.  Accessing ``self.unified_search``
         lazily initialises ChromaDB if it hasn't been created yet.
+
+        For code-related traces, dual-indexes in both the episodic (NL)
+        collection and the code collection (code embeddings).
         """
         try:
             sem = self._semantic_search
@@ -192,7 +205,18 @@ class MemorySystem:
                 _ = self.unified_search
                 sem = self._semantic_search
             if sem is not None:
+                # Always index in episodic (NL embeddings)
                 sem.index_trace(trace_id, content, metadata)
+
+                # Dual-index code content in code collection
+                if sem.has_code_embeddings:
+                    from engram.search.code_embeddings import is_code_content
+
+                    kind = metadata.get("kind", "")
+                    if is_code_content(trace_kind=kind, content=content):
+                        code_meta = dict(metadata)
+                        code_meta["trace_id"] = trace_id
+                        sem.index_code(f"code_{trace_id}", content, code_meta)
         except Exception as exc:
             log.debug("Incremental vector indexing failed for %s: %s", trace_id, exc)
 
@@ -244,8 +268,11 @@ class MemorySystem:
                 sem = SemanticSearch(
                     embeddings_dir=self.config.embeddings_dir,
                     embedding_func=self._embedding_func,
+                    code_embedding_func=self._code_embedding_func,
                 )
                 self._semantic_search = sem
+                if sem.has_code_embeddings:
+                    log.info("Dual-embedding space active (NL + code)")
             except Exception as exc:
                 log.warning("Failed to init semantic search: %s", exc)
 
@@ -485,6 +512,12 @@ class MemorySystem:
 
         pressure = trace_count / max(1, self.config.max_traces)
 
+        # Check code embedding status
+        code_emb_active = (
+            self._semantic_search is not None
+            and self._semantic_search.has_code_embeddings
+        )
+
         return MemoryStats(
             episodic_count=trace_count,
             semantic_facts=rel_count,
@@ -492,6 +525,7 @@ class MemorySystem:
             total_messages=msg_count,
             avg_salience=avg_sal,
             memory_pressure=pressure,
+            code_embeddings_active=code_emb_active,
         )
 
     # ------------------------------------------------------------------

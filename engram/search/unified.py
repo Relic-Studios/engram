@@ -154,14 +154,20 @@ class UnifiedSearch:
 
     @staticmethod
     def _map_collections(memory_type: Optional[str]) -> Optional[List[str]]:
-        """Map a ``memory_type`` filter to ChromaDB collection names."""
+        """Map a ``memory_type`` filter to ChromaDB collection names.
+
+        When ``memory_type`` is None, returns None which tells
+        SemanticSearch to query all active collections (including
+        the code collection if dual-embedding is enabled).
+        """
         if memory_type == "messages":
             # Messages aren't in ChromaDB by default; search episodic
             # which contains traces from conversations
             return ["episodic"]
         if memory_type == "traces":
-            return ["episodic"]
-        # None → search all
+            # Search both NL and code embeddings for traces
+            return ["episodic", "code"]
+        # None → search all active collections
         return None
 
     @staticmethod
