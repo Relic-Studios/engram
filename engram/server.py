@@ -14,7 +14,7 @@ Or configure in your MCP client (OpenCode, OpenClaw, etc.) as:
         }
     }
 
-Tools exposed (24 total):
+Tools exposed (29 total):
     Core Pipeline:
         engram_before        -- Pre-LLM context injection
         engram_after         -- Post-LLM logging + learning
@@ -23,7 +23,7 @@ Tools exposed (24 total):
         engram_search        -- Search across all memory
         engram_recall        -- Get specific memory/relationship
         engram_stats         -- Memory system health metrics
-        engram_signal        -- Current signal tracker state
+        engram_signal        -- Current code quality signal state
     Write:
         engram_add_fact      -- Add fact to relationship
         engram_add_skill     -- Add procedural skill
@@ -46,6 +46,12 @@ Tools exposed (24 total):
     Workspace:
         engram_workspace_add      -- Add to working memory
         engram_workspace_status   -- Get working memory status
+    Code-First (Phase 4):
+        engram_architecture_decision -- Record an ADR
+        engram_code_pattern  -- Store/get reusable code patterns
+        engram_debug_log     -- Log error + resolution
+        engram_get_rules     -- Get coding standards
+        engram_project_init  -- Initialize project scope
     Maintenance:
         engram_reindex       -- Rebuild search index
 """
@@ -136,10 +142,11 @@ mcp = FastMCP(
 # Tools reference it via _get_system().
 _system: Optional[MemorySystem] = None
 
-# Current source/person set by engram_before() for trust gating
+# Current source/person/project set by engram_before() for scoping
 # across subsequent tool calls within the same conversation turn.
 _current_source: str = "direct"
 _current_person: str = ""
+_current_project: str = ""
 
 
 def init_system(
@@ -1240,6 +1247,73 @@ def engram_get_rules(file_path: str = "") -> str:
         result["scoped_to"] = file_path
 
     return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+@_safe_json
+def engram_project_init(
+    project_name: str,
+    description: str = "",
+    languages: str = "",
+    patterns: str = "",
+) -> str:
+    """Initialize or switch to a project scope for memory isolation.
+
+    Sets the active project context so subsequent memory operations
+    (traces, messages, sessions) are scoped to this project.  Also
+    creates a project_context trace capturing the project metadata.
+
+    Call this when starting work on a specific project or repository.
+
+    Args:
+        project_name: Project identifier (e.g., "engram", "my-api").
+        description: Brief description of the project.
+        languages: Comma-separated languages (e.g., "python,typescript").
+        patterns: Comma-separated architectural patterns used.
+    """
+    global _current_project
+    system = _get_system()
+
+    _current_project = project_name
+
+    # Store project context as a high-salience trace
+    context_parts = [f"# Project: {project_name}"]
+    if description:
+        context_parts.append(f"\n{description}")
+    if languages:
+        context_parts.append(f"\nLanguages: {languages}")
+    if patterns:
+        context_parts.append(f"\nPatterns: {patterns}")
+
+    content = "\n".join(context_parts)
+    tags = ["project", project_name]
+    if languages:
+        tags.extend(l.strip() for l in languages.split(",") if l.strip())
+
+    trace_id = system.episodic.log_trace(
+        content=content,
+        kind="project_context",
+        tags=tags,
+        salience=0.9,
+        project=project_name,
+    )
+
+    # Load existing ADRs for this project
+    adrs = system.episodic.get_traces_by_kind(
+        "architecture_decision",
+        limit=10,
+        project=project_name,
+    )
+
+    return json.dumps(
+        {
+            "project": project_name,
+            "trace_id": trace_id,
+            "active_adrs": len(adrs),
+            "message": f"Project '{project_name}' initialized. "
+            f"Memory operations now scoped to this project.",
+        }
+    )
 
 
 # ===========================================================================

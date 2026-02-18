@@ -85,6 +85,7 @@ class Trace:
     tags: List[str] = field(default_factory=list)
     salience: float = 0.5
     metadata: Dict = field(default_factory=dict)
+    project: str = ""  # Project scope (empty = global)
 
     # auto-populated
     id: str = field(default_factory=generate_id)

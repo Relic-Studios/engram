@@ -113,7 +113,8 @@ class EpisodicStore:
                 signal          JSON,
                 metadata        JSON,
                 access_count    INTEGER DEFAULT 0,
-                last_accessed   TEXT
+                last_accessed   TEXT,
+                project         TEXT DEFAULT ''
             )
         """)
 
@@ -139,7 +140,8 @@ class EpisodicStore:
                 tokens          INTEGER,
                 access_count    INTEGER DEFAULT 0,
                 last_accessed   TEXT,
-                metadata        JSON
+                metadata        JSON,
+                project         TEXT DEFAULT ''
             )
         """)
 
@@ -151,11 +153,12 @@ class EpisodicStore:
                 person      TEXT,
                 timestamp   TEXT,
                 salience    REAL DEFAULT 0.5,
-                metadata    JSON
+                metadata    JSON,
+                project     TEXT DEFAULT ''
             )
         """)
 
-        # Indexes
+        # Indexes (for messages, traces, events — created above)
         for stmt in [
             "CREATE INDEX IF NOT EXISTS idx_messages_person    ON messages(person)",
             "CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp)",
@@ -207,7 +210,8 @@ class EpisodicStore:
                 ended       TEXT,
                 message_count INTEGER DEFAULT 0,
                 summary     TEXT,
-                metadata    JSON
+                metadata    JSON,
+                project     TEXT DEFAULT ''
             )
         """)
 
@@ -215,6 +219,23 @@ class EpisodicStore:
         c.execute(
             "CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started)"
         )
+
+        # Migration (v2 pivot): add project column to existing databases
+        # that were created before the column existed.  Must run AFTER
+        # all CREATE TABLE statements so the tables exist.
+        for table in ("messages", "traces", "events", "sessions"):
+            try:
+                c.execute(f"ALTER TABLE {table} ADD COLUMN project TEXT DEFAULT ''")
+            except sqlite3.OperationalError:
+                pass  # column already exists
+
+        # Project indexes (must be after migration adds the column)
+        for stmt in [
+            "CREATE INDEX IF NOT EXISTS idx_traces_project   ON traces(project)",
+            "CREATE INDEX IF NOT EXISTS idx_messages_project  ON messages(project)",
+            "CREATE INDEX IF NOT EXISTS idx_sessions_project  ON sessions(project)",
+        ]:
+            c.execute(stmt)
 
         # Relationship graph — lightweight temporal knowledge graph
         # (Zep/Graphiti-inspired, no Neo4j dependency).
@@ -291,6 +312,7 @@ class EpisodicStore:
         source: str,
         salience: float = 0.5,
         signal: Optional[Dict] = None,
+        project: str = "",
         **metadata,
     ) -> str:
         """Record a conversation message. Returns the message ID.
@@ -322,8 +344,9 @@ class EpisodicStore:
         self.conn.execute(
             """
             INSERT INTO messages (id, person, speaker, content, source,
-                                  timestamp, salience, signal, metadata)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                  timestamp, salience, signal, metadata,
+                                  project)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 msg_id,
@@ -335,6 +358,7 @@ class EpisodicStore:
                 salience,
                 json.dumps(signal) if signal else None,
                 json.dumps(metadata) if metadata else None,
+                project,
             ),
         )
         self._commit()
@@ -346,6 +370,7 @@ class EpisodicStore:
         kind: str,
         tags: List[str],
         salience: float = 0.5,
+        project: str = "",
         **metadata,
     ) -> str:
         """Record an experiential trace (summary, insight, reflection). Returns trace ID.
@@ -385,8 +410,9 @@ class EpisodicStore:
         self.conn.execute(
             """
             INSERT INTO traces (id, content, created, kind, tags, salience,
-                                tokens, access_count, last_accessed, metadata)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+                                tokens, access_count, last_accessed, metadata,
+                                project)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
             """,
             (
                 trace_id,
@@ -398,6 +424,7 @@ class EpisodicStore:
                 tokens,
                 now,
                 json.dumps(metadata) if metadata else None,
+                project,
             ),
         )
         self._commit()
@@ -411,6 +438,7 @@ class EpisodicStore:
                         "kind": kind,
                         "salience": salience,
                         "created": now,
+                        "project": project,
                     }
                 )
                 self._on_trace_logged(trace_id, content, trace_meta)
@@ -425,15 +453,16 @@ class EpisodicStore:
         description: str,
         person: Optional[str] = None,
         salience: float = 0.5,
+        project: str = "",
         **metadata,
     ) -> str:
-        """Record a discrete event (trust change, injury, milestone). Returns event ID."""
+        """Record a discrete event. Returns event ID."""
         event_id = _generate_id()
         self.conn.execute(
             """
             INSERT INTO events (id, type, description, person,
-                                timestamp, salience, metadata)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                                timestamp, salience, metadata, project)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 event_id,
@@ -443,6 +472,7 @@ class EpisodicStore:
                 _now(),
                 salience,
                 json.dumps(metadata) if metadata else None,
+                project,
             ),
         )
         self._commit()
@@ -498,14 +528,23 @@ class EpisodicStore:
         kind: Optional[str] = None,
         min_salience: float = 0.0,
         limit: int = 50,
+        project: Optional[str] = None,
     ) -> List[Dict]:
-        """Retrieve traces with optional filters."""
+        """Retrieve traces with optional filters.
+
+        When ``project`` is provided, only traces scoped to that project
+        (or global traces with project='') are returned.
+        """
         clauses = ["salience >= ?"]
         params: list = [min_salience]
 
         if kind:
             clauses.append("kind = ?")
             params.append(kind)
+
+        if project is not None:
+            clauses.append("(project = ? OR project = '')")
+            params.append(project)
 
         where = " AND ".join(clauses)
         params.append(limit)
@@ -569,13 +608,23 @@ class EpisodicStore:
         return deduped[-limit:]  # trim to requested limit
 
     def get_by_salience(
-        self, person: Optional[str] = None, limit: int = 30
+        self,
+        person: Optional[str] = None,
+        limit: int = 30,
+        project: Optional[str] = None,
     ) -> List[Dict]:
-        """Get the highest-salience traces, optionally filtered by person tag."""
-        rows = self.conn.execute(
-            "SELECT * FROM traces ORDER BY salience DESC LIMIT ?",
-            (limit * 3,),  # over-fetch to allow Python tag filtering
-        ).fetchall()
+        """Get the highest-salience traces, optionally filtered by person tag and project."""
+        if project is not None:
+            rows = self.conn.execute(
+                "SELECT * FROM traces WHERE (project = ? OR project = '') "
+                "ORDER BY salience DESC LIMIT ?",
+                (project, limit * 3),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM traces ORDER BY salience DESC LIMIT ?",
+                (limit * 3,),  # over-fetch to allow Python tag filtering
+            ).fetchall()
 
         results = [self._row_to_dict(r) for r in rows]
 
@@ -842,16 +891,18 @@ class EpisodicStore:
         self,
         person: str,
         started: Optional[str] = None,
+        project: str = "",
     ) -> str:
         """Create a new session. Returns session ID."""
         session_id = _generate_id()
         started = started or _now()
         self.conn.execute(
             """
-            INSERT INTO sessions (id, person, started, ended, message_count, summary, metadata)
-            VALUES (?, ?, ?, NULL, 0, NULL, NULL)
+            INSERT INTO sessions (id, person, started, ended, message_count,
+                                  summary, metadata, project)
+            VALUES (?, ?, ?, NULL, 0, NULL, NULL, ?)
             """,
-            (session_id, person, started),
+            (session_id, person, started, project),
         )
         self._commit()
         return session_id
@@ -1051,21 +1102,35 @@ class EpisodicStore:
         kind: str,
         limit: int = 50,
         min_salience: float = 0.0,
+        project: Optional[str] = None,
     ) -> List[Dict]:
         """Retrieve traces of a specific kind (temporal, utility, etc.).
 
         Metadata is automatically deserialized so callers can access
         temporal decay/revival data or utility Q-values directly.
+        When ``project`` is provided, includes project-scoped + global traces.
         """
-        rows = self.conn.execute(
-            """
-            SELECT * FROM traces
-            WHERE kind = ? AND salience >= ?
-            ORDER BY salience DESC
-            LIMIT ?
-            """,
-            (kind, min_salience, limit),
-        ).fetchall()
+        if project is not None:
+            rows = self.conn.execute(
+                """
+                SELECT * FROM traces
+                WHERE kind = ? AND salience >= ?
+                  AND (project = ? OR project = '')
+                ORDER BY salience DESC
+                LIMIT ?
+                """,
+                (kind, min_salience, project, limit),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                """
+                SELECT * FROM traces
+                WHERE kind = ? AND salience >= ?
+                ORDER BY salience DESC
+                LIMIT ?
+                """,
+                (kind, min_salience, limit),
+            ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
     def get_traces_with_metadata(
