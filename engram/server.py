@@ -14,7 +14,7 @@ Or configure in your MCP client (OpenCode, OpenClaw, etc.) as:
         }
     }
 
-Tools exposed (29 total):
+Tools exposed (30 total):
     Core Pipeline:
         engram_before        -- Pre-LLM context injection
         engram_after         -- Post-LLM logging + learning
@@ -51,6 +51,7 @@ Tools exposed (29 total):
         engram_code_pattern  -- Store/get reusable code patterns
         engram_debug_log     -- Log error + resolution
         engram_get_rules     -- Get coding standards
+        engram_add_wiring    -- Record code dependency relationship
         engram_project_init  -- Initialize project scope
     Maintenance:
         engram_reindex       -- Rebuild search index
@@ -1247,6 +1248,71 @@ def engram_get_rules(file_path: str = "") -> str:
         result["scoped_to"] = file_path
 
     return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+@_safe_json
+def engram_add_wiring(
+    subject: str,
+    predicate: str,
+    object: str,
+    confidence: float = 0.9,
+) -> str:
+    """Record a code dependency relationship in the knowledge graph.
+
+    Builds the project's wiring map by recording structural relationships
+    between code entities.  Enables multi-hop reasoning: e.g., "what
+    modules depend on the database schema?"
+
+    Supported predicates:
+      - depends_on:  A depends on B (import, API call, etc.)
+      - exports:     A exports B (function, class, constant)
+      - validates:   A validates B (test file -> source file)
+      - supersedes:  A supersedes B (ADR versioning, API migration)
+      - uses:        A uses B (lighter than depends_on)
+      - implements:  A implements B (interface realization)
+
+    Args:
+        subject: Source entity (e.g., "auth.py", "UserService", "v2.0").
+        predicate: Relationship type (see above).
+        object: Target entity (e.g., "database.py", "verify_token").
+        confidence: Confidence in this relationship (0-1, default 0.9).
+    """
+    system = _get_system()
+
+    valid_predicates = {
+        "depends_on",
+        "exports",
+        "validates",
+        "supersedes",
+        "uses",
+        "implements",
+    }
+    if predicate not in valid_predicates:
+        return json.dumps(
+            {
+                "error": f"Unknown predicate '{predicate}'. "
+                f"Valid predicates: {sorted(valid_predicates)}",
+            }
+        )
+
+    rel_id = system.episodic.add_relationship(
+        subject=subject,
+        predicate=predicate,
+        object=object,
+        confidence=_clamp(confidence),
+    )
+
+    return json.dumps(
+        {
+            "relationship_id": rel_id,
+            "subject": subject,
+            "predicate": predicate,
+            "object": object,
+            "confidence": confidence,
+            "message": f"Wiring recorded: {subject} --[{predicate}]--> {object}",
+        }
+    )
 
 
 @mcp.tool()

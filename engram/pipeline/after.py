@@ -207,8 +207,17 @@ def after(
         trace_ids=trace_ids,
         llm_func=llm_func,
     )
-    signal_tracker.record(signal)
     timings["signal_measure"] = time.perf_counter() - _t0
+
+    # -- 1b. Style adherence check (adjusts consistency facet) -------------
+    #    If the response contains code, run the style drift detector and
+    #    blend the result into the consistency facet.  This creates a
+    #    tighter feedback loop: style drift -> lower CQS -> lower salience.
+    _t0 = time.perf_counter()
+    signal = _apply_style_check(signal, response)
+    timings["style_check"] = time.perf_counter() - _t0
+
+    signal_tracker.record(signal)
 
     # -- 2. Derive salience from signal health -----------------------------
     salience = _derive_salience(signal.health, their_message, response)
@@ -387,6 +396,61 @@ def _measure_signal(
     except Exception as exc:
         log.warning("Signal measurement failed, using defaults: %s", exc)
         return Signal(trace_ids=trace_ids)
+
+
+def _apply_style_check(signal: Signal, response: str) -> Signal:
+    """Run style drift detection and blend into the consistency facet.
+
+    Only runs if the response appears to contain code (has indented
+    lines or code block markers).  The style score is blended with the
+    existing consistency facet at a 30/70 ratio (30% style, 70% regex).
+    """
+    # Quick heuristic: does the response contain code?
+    lines = response.split("\n")
+    code_indicators = sum(
+        1
+        for line in lines
+        if line.startswith("    ")
+        or line.startswith("\t")
+        or line.strip().startswith("def ")
+        or line.strip().startswith("class ")
+        or line.strip().startswith("function ")
+        or "```" in line
+    )
+    if code_indicators < 2:
+        return signal  # No meaningful code to assess
+
+    try:
+        from engram.signal.style import assess_style, StyleProfile
+
+        # Extract code blocks if wrapped in markdown fences
+        code_text = response
+        if "```" in response:
+            blocks = []
+            in_block = False
+            for line in lines:
+                if line.strip().startswith("```"):
+                    in_block = not in_block
+                    continue
+                if in_block:
+                    blocks.append(line)
+            if blocks:
+                code_text = "\n".join(blocks)
+
+        result = assess_style(code_text, StyleProfile.python_default())
+
+        # Blend style score into consistency: 30% style, 70% existing
+        blended_consistency = signal.consistency * 0.7 + result.score * 0.3
+        return Signal(
+            correctness=signal.correctness,
+            consistency=blended_consistency,
+            completeness=signal.completeness,
+            robustness=signal.robustness,
+            trace_ids=signal.trace_ids,
+        )
+    except Exception as exc:
+        log.debug("Style check failed: %s", exc)
+        return signal
 
 
 def _derive_salience(health: float, their_message: str, response: str) -> float:
