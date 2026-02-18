@@ -7,12 +7,13 @@ Measures LLM responses across four code quality facets:
   completeness — error handling, edge cases, tests, documentation
   robustness   — input validation, resource cleanup, error boundaries
 
-Two measurement modes:
+Three measurement modes:
   - Regex-based (always available, zero dependencies, <1ms)
-  - LLM-based  (optional, higher quality, requires an llm_func callback)
+  - AST-based   (structural analysis via tree-sitter + stdlib ast, <50ms)
+  - LLM-based   (optional, higher quality, requires an llm_func callback)
 
-The public API is `measure()` which runs regex always and blends in LLM
-scores when a callback is provided.
+The public API is `measure()` which runs regex + AST always and blends
+in LLM scores when a callback is provided.
 
 Replaces the v1 consciousness signal measurement (alignment, embodiment,
 clarity, vitality) as part of the code-first pivot.
@@ -271,6 +272,201 @@ def measure_regex(text: str) -> Signal:
 
 
 # ---------------------------------------------------------------------------
+# AST-based measurement
+# ---------------------------------------------------------------------------
+
+
+def measure_ast(text: str) -> Optional[Signal]:
+    """
+    Measure CQS facets using AST structural analysis.
+
+    Parses code blocks from the response, runs full AST extraction,
+    and derives scores from structural properties rather than regex
+    pattern matching.
+
+    Returns None if no parseable code blocks are found.
+    """
+    try:
+        from engram.extraction.ast_engine import analyze_response
+    except ImportError:
+        log.debug("AST extraction not available, skipping AST measurement")
+        return None
+
+    analyses = analyze_response(text)
+    if not analyses:
+        return None
+
+    # Aggregate metrics across all code blocks
+    total_complexity = 0
+    total_max_depth = 0
+    total_funcs = 0
+    total_classes = 0
+    total_with_annotations = 0
+    total_with_docstrings = 0
+    total_documentable = 0
+    total_assertions = 0
+    total_bare_except = 0
+    total_broad_except = 0
+    total_eval_exec = 0
+    total_wildcard_imports = 0
+    total_empty_blocks = 0
+    has_parse_errors = False
+    has_tests = False
+
+    for analysis in analyses:
+        if analysis.parse_errors:
+            has_parse_errors = True
+        cx = analysis.complexity
+        total_complexity += cx.cyclomatic_complexity
+        total_max_depth = max(total_max_depth, cx.max_nesting_depth)
+        total_funcs += cx.num_functions
+        total_classes += cx.num_classes
+        total_bare_except += cx.bare_except_count
+        total_broad_except += cx.broad_except_count
+        total_eval_exec += cx.eval_exec_count
+        total_wildcard_imports += cx.wildcard_import_count
+        total_empty_blocks += cx.empty_block_count
+        has_tests = has_tests or cx.has_tests
+        total_assertions += int(cx.assertion_density * cx.num_functions)
+
+        # Annotation and docstring counts
+        documentable = cx.num_functions + cx.num_classes
+        total_documentable += documentable
+        if documentable > 0:
+            total_with_annotations += int(
+                cx.type_annotation_coverage * cx.num_functions
+            )
+            total_with_docstrings += int(cx.docstring_coverage * documentable)
+
+    # --- Correctness from AST ---
+    # Syntax validity is the strongest signal AST provides
+    if has_parse_errors:
+        ast_correctness = 0.25  # Hard penalty for unparseable code
+    else:
+        ast_correctness = 0.7  # Parseable = solid baseline
+        # Complexity penalty: McCabe > 10 per function is a yellow flag
+        if total_funcs > 0:
+            avg_complexity = total_complexity / total_funcs
+            if avg_complexity <= 5:
+                ast_correctness += 0.15
+            elif avg_complexity <= 10:
+                ast_correctness += 0.05
+            elif avg_complexity > 15:
+                ast_correctness -= 0.1
+
+    # --- Consistency from AST ---
+    # Wildcard imports and naming convention analysis
+    ast_consistency = 0.6  # Baseline for parseable code
+    if total_wildcard_imports > 0:
+        ast_consistency -= 0.15 * min(total_wildcard_imports, 3)
+    # Nesting depth penalty (>4 levels suggests inconsistent abstraction)
+    if total_max_depth > 6:
+        ast_consistency -= 0.1
+    elif total_max_depth <= 3:
+        ast_consistency += 0.1
+
+    # --- Completeness from AST ---
+    ast_completeness = 0.5
+    # Type annotation coverage
+    if total_funcs > 0:
+        ann_ratio = total_with_annotations / total_funcs
+        ast_completeness += ann_ratio * 0.15
+
+    # Docstring coverage
+    if total_documentable > 0:
+        doc_ratio = total_with_docstrings / total_documentable
+        ast_completeness += doc_ratio * 0.15
+
+    # Test presence
+    if has_tests:
+        ast_completeness += 0.1
+        # Assertion density bonus
+        if total_funcs > 0 and total_assertions / total_funcs > 1.0:
+            ast_completeness += 0.05
+
+    # Empty block penalty
+    if total_empty_blocks > 0:
+        ast_completeness -= 0.1 * min(total_empty_blocks, 3)
+
+    # --- Robustness from AST ---
+    ast_robustness = 0.55
+    # Anti-pattern penalties (detected at AST level, much more reliable than regex)
+    if total_bare_except > 0:
+        ast_robustness -= 0.15 * min(total_bare_except, 3)
+    if total_broad_except > 0:
+        ast_robustness -= 0.08 * min(total_broad_except, 3)
+    if total_eval_exec > 0:
+        ast_robustness -= 0.2 * min(total_eval_exec, 2)
+    # Bonus for well-structured code (low complexity, good annotation)
+    if total_funcs > 0 and total_complexity / total_funcs <= 5:
+        ast_robustness += 0.1
+
+    return Signal(
+        correctness=max(0.0, min(1.0, ast_correctness)),
+        consistency=max(0.0, min(1.0, ast_consistency)),
+        completeness=max(0.0, min(1.0, ast_completeness)),
+        robustness=max(0.0, min(1.0, ast_robustness)),
+    )
+
+
+def blend_regex_ast(
+    regex_signal: Signal,
+    ast_signal: Signal,
+    ast_weight: float = 0.4,
+) -> Signal:
+    """
+    Blend regex and AST measurements.
+
+    Default: 60% regex, 40% AST. AST is weighted higher for correctness
+    (where syntax validity is definitive) and robustness (where anti-
+    pattern detection is more reliable at the node level).
+    """
+    rw = 1.0 - ast_weight
+    # Per-facet weights: AST is more authoritative for correctness/robustness
+    ast_w = {
+        "correctness": ast_weight + 0.1,  # AST knows if code parses
+        "consistency": ast_weight - 0.05,  # regex catches prose patterns too
+        "completeness": ast_weight,
+        "robustness": ast_weight + 0.1,  # AST catches anti-patterns precisely
+    }
+
+    return Signal(
+        correctness=max(
+            0.0,
+            min(
+                1.0,
+                (1.0 - ast_w["correctness"]) * regex_signal.correctness
+                + ast_w["correctness"] * ast_signal.correctness,
+            ),
+        ),
+        consistency=max(
+            0.0,
+            min(
+                1.0,
+                (1.0 - ast_w["consistency"]) * regex_signal.consistency
+                + ast_w["consistency"] * ast_signal.consistency,
+            ),
+        ),
+        completeness=max(
+            0.0,
+            min(
+                1.0,
+                (1.0 - ast_w["completeness"]) * regex_signal.completeness
+                + ast_w["completeness"] * ast_signal.completeness,
+            ),
+        ),
+        robustness=max(
+            0.0,
+            min(
+                1.0,
+                (1.0 - ast_w["robustness"]) * regex_signal.robustness
+                + ast_w["robustness"] * ast_signal.robustness,
+            ),
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
 # LLM-based measurement
 # ---------------------------------------------------------------------------
 
@@ -386,9 +582,15 @@ def measure(
     """
     Measure Code Quality Signal in a text response.
 
-    Always runs regex measurement.  If *llm_func* is provided, also calls
-    the LLM for a higher-quality reading and blends the two.  Falls back
-    to regex-only silently if the LLM call fails.
+    Always runs regex + AST measurement.  If *llm_func* is provided,
+    also calls the LLM for a higher-quality reading and blends all three.
+    Falls back gracefully: regex+AST if LLM fails, regex-only if AST
+    extraction is unavailable.
+
+    Three-way blend when all available:
+      - AST weight: ~40% (higher for correctness/robustness)
+      - LLM weight: applied to the regex+AST blend
+      - Regex: fills the remainder
 
     Parameters
     ----------
@@ -407,31 +609,34 @@ def measure(
     """
     regex_signal = measure_regex(text)
 
-    if llm_func is None:
-        if trace_ids:
-            regex_signal.trace_ids = trace_ids
-        return regex_signal
+    # Step 1: Blend in AST if available
+    ast_signal = measure_ast(text)
+    if ast_signal is not None:
+        base_signal = blend_regex_ast(regex_signal, ast_signal)
+    else:
+        base_signal = regex_signal
 
-    # Attempt LLM measurement
-    try:
-        user_prompt = LLM_SIGNAL_USER_TEMPLATE.format(
-            soul=soul_text[:2000],
-            prompt=prompt,
-            response=text,
-        )
-        raw = llm_func(user_prompt, LLM_SIGNAL_SYSTEM)
-        llm_scores = parse_llm_signal(raw)
-
-        if llm_scores is not None:
-            return blend_signals(
-                regex_signal, llm_scores, llm_weight=llm_weight, trace_ids=trace_ids
+    # Step 2: Blend in LLM if available
+    if llm_func is not None:
+        try:
+            user_prompt = LLM_SIGNAL_USER_TEMPLATE.format(
+                soul=soul_text[:2000],
+                prompt=prompt,
+                response=text,
             )
-    except Exception as exc:
-        log.debug("LLM signal measurement failed, using regex-only: %s", exc)
+            raw = llm_func(user_prompt, LLM_SIGNAL_SYSTEM)
+            llm_scores = parse_llm_signal(raw)
+
+            if llm_scores is not None:
+                return blend_signals(
+                    base_signal, llm_scores, llm_weight=llm_weight, trace_ids=trace_ids
+                )
+        except Exception as exc:
+            log.debug("LLM signal measurement failed, using regex+AST: %s", exc)
 
     if trace_ids:
-        regex_signal.trace_ids = trace_ids
-    return regex_signal
+        base_signal.trace_ids = trace_ids
+    return base_signal
 
 
 # ---------------------------------------------------------------------------

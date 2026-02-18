@@ -296,7 +296,95 @@ class EpisodicStore:
             except sqlite3.OperationalError:
                 pass  # table might be empty, that's fine
 
+        # Apply symbol expansion to the FTS index.
+        # After the trigger-based rebuild populates raw content,
+        # re-index with expanded content for code symbol search.
+        self._rebuild_fts_expanded(c)
+
         self.conn.commit()
+
+    # ── FTS symbol expansion ─────────────────────────────────
+
+    def _fts_replace_expanded(self, table: str, rowid: int, content: str) -> None:
+        """Replace a raw FTS entry with symbol-expanded content.
+
+        Called after INSERT (which triggers raw-content FTS insert).
+        Replaces the trigger's entry with expanded content that splits
+        compound identifiers (camelCase, snake_case, dot.paths) into
+        individual searchable tokens.
+
+        This is a no-op if the tokenizer module is not available or
+        the content has no compound identifiers to expand.
+        """
+        try:
+            from engram.search.tokenizer import expand_text
+        except ImportError:
+            return  # tokenizer not available — keep raw content
+
+        expanded = expand_text(content)
+        if expanded == content:
+            return  # nothing to expand
+
+        fts = f"{table}_fts"
+        try:
+            # Delete the trigger-inserted raw entry, insert expanded
+            self.conn.execute(
+                f"INSERT INTO {fts}({fts}, rowid, content) VALUES('delete', ?, ?)",
+                (rowid, content),
+            )
+            self.conn.execute(
+                f"INSERT INTO {fts}(rowid, content) VALUES(?, ?)",
+                (rowid, expanded),
+            )
+        except Exception:
+            pass  # best-effort — don't break the write path
+
+    def _get_last_rowid(self) -> int:
+        """Get the rowid of the last INSERT."""
+        row = self.conn.execute("SELECT last_insert_rowid()").fetchone()
+        return row[0] if row else 0
+
+    def _rebuild_fts_expanded(self, cursor=None) -> int:
+        """Re-expand all FTS entries with symbol-tokenized content.
+
+        Called during table creation / migration to ensure existing
+        content gets symbol expansion applied.  Returns the number
+        of entries expanded.
+        """
+        try:
+            from engram.search.tokenizer import expand_text
+        except ImportError:
+            return 0
+
+        c = cursor or self.conn
+        expanded_count = 0
+
+        for table, fts in [("messages", "messages_fts"), ("traces", "traces_fts")]:
+            try:
+                rows = c.execute(f"SELECT rowid, content FROM {table}").fetchall()
+            except sqlite3.OperationalError:
+                continue
+
+            for row in rows:
+                rowid = row[0]
+                content = row[1] or ""
+                expanded = expand_text(content)
+                if expanded != content:
+                    try:
+                        c.execute(
+                            f"INSERT INTO {fts}({fts}, rowid, content) "
+                            f"VALUES('delete', ?, ?)",
+                            (rowid, content),
+                        )
+                        c.execute(
+                            f"INSERT INTO {fts}(rowid, content) VALUES(?, ?)",
+                            (rowid, expanded),
+                        )
+                        expanded_count += 1
+                    except Exception:
+                        pass
+
+        return expanded_count
 
     # ── Write ─────────────────────────────────────────────────
 
@@ -361,6 +449,9 @@ class EpisodicStore:
                 project,
             ),
         )
+        # Replace raw FTS entry with symbol-expanded content
+        rowid = self._get_last_rowid()
+        self._fts_replace_expanded("messages", rowid, content)
         self._commit()
         return msg_id
 
@@ -427,6 +518,9 @@ class EpisodicStore:
                 project,
             ),
         )
+        # Replace raw FTS entry with symbol-expanded content
+        rowid = self._get_last_rowid()
+        self._fts_replace_expanded("traces", rowid, content)
         self._commit()
 
         # Fire incremental vector-indexing callback (FR-2)

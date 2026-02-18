@@ -3,8 +3,14 @@ engram.signal.style -- Architectural style adherence and pattern drift detection
 
 Replaces the old consciousness/identity.py dissociation detector.
 Where that module used regex to detect phrases like "as an AI" (identity
-drift), this module uses regex to detect code style violations (pattern
-drift) — naming inconsistencies, forbidden constructs, and anti-patterns.
+drift), this module uses regex + AST to detect code style violations
+(pattern drift) — naming inconsistencies, forbidden constructs, and
+anti-patterns.
+
+When AST extraction is available, the naming convention checker uses
+actual parsed symbols (function names, variable names from the AST)
+instead of regex heuristics. The nesting depth check also uses AST
+node depth when available, which is more reliable than indent-counting.
 
 The drift detector is configurable per-project via StyleProfile, which
 defines the expected naming convention, forbidden patterns, and
@@ -20,9 +26,12 @@ Usage:
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
+
+log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -220,11 +229,79 @@ _CLASS_DEF = re.compile(r"class\s+([a-zA-Z_]\w*)")
 _ASSIGN = re.compile(r"^(\s*)([a-zA-Z_]\w*)\s*(?::\s*\w+)?\s*=", re.MULTILINE)
 
 
+def _check_naming_ast(
+    code: str,
+    convention: str,
+) -> Optional[List[Violation]]:
+    """Check identifiers using AST extraction (more reliable than regex).
+
+    Returns None if AST is not available, so we can fall back to regex.
+    """
+    if convention == "any":
+        return []
+
+    try:
+        from engram.extraction.ast_engine import analyze_code, SymbolKind
+    except ImportError:
+        return None
+
+    checker = {
+        "snake_case": _SNAKE_CASE,
+        "camelCase": _CAMEL_CASE,
+        "PascalCase": _PASCAL_CASE,
+    }.get(convention)
+
+    if checker is None:
+        return []
+
+    analysis = analyze_code(code)
+    if not analysis.symbols:
+        return None  # No symbols found — fall back to regex
+
+    violations: List[Violation] = []
+
+    for symbol in analysis.symbols:
+        name = symbol.name
+        # Skip dunder methods, single-char names, ALL_CAPS constants,
+        # private names, and class names (always PascalCase)
+        if (
+            name.startswith("_")
+            or len(name) <= 1
+            or _UPPER_SNAKE.match(name)
+            or symbol.kind == SymbolKind.CLASS
+            or symbol.kind == SymbolKind.CONSTANT
+            or symbol.kind == SymbolKind.INTERFACE
+        ):
+            continue
+
+        if not checker.match(name):
+            kind_label = symbol.kind.value
+            severity = (
+                0.3 if symbol.kind in (SymbolKind.FUNCTION, SymbolKind.METHOD) else 0.2
+            )
+            violations.append(
+                Violation(
+                    category="naming",
+                    description=(
+                        f"{kind_label} '{name}' (line {symbol.line}) "
+                        f"doesn't follow {convention} convention"
+                    ),
+                    severity=severity,
+                    line_hint=name,
+                )
+            )
+
+    return violations
+
+
 def _check_naming(
     code: str,
     convention: str,
 ) -> List[Violation]:
     """Check identifiers against the expected naming convention.
+
+    Attempts AST-based extraction first (more reliable). Falls back
+    to regex-based extraction if AST is unavailable or returns no symbols.
 
     Only checks function/method definitions and top-level variable
     assignments — not class names (which are always PascalCase by
@@ -233,6 +310,12 @@ def _check_naming(
     if convention == "any":
         return []
 
+    # Try AST first
+    ast_result = _check_naming_ast(code, convention)
+    if ast_result is not None:
+        return ast_result
+
+    # Fallback: regex-based
     checker = {
         "snake_case": _SNAKE_CASE,
         "camelCase": _CAMEL_CASE,
@@ -288,11 +371,42 @@ def _check_naming(
 
 
 def _check_nesting_depth(code: str, max_depth: int) -> List[Violation]:
-    """Check for excessive nesting depth in code."""
+    """Check for excessive nesting depth in code.
+
+    Attempts AST-based depth measurement first (precise). Falls back
+    to indent-counting heuristic if AST is unavailable.
+    """
     if max_depth <= 0:
         return []
 
     violations: List[Violation] = []
+
+    # Try AST-based depth measurement first
+    try:
+        from engram.extraction.ast_engine import analyze_code
+
+        analysis = analyze_code(code)
+        if analysis.complexity.max_nesting_depth > 0:
+            actual_depth = analysis.complexity.max_nesting_depth
+            if actual_depth > max_depth:
+                violations.append(
+                    Violation(
+                        category="anti_pattern",
+                        description=(
+                            f"AST nesting depth {actual_depth} exceeds "
+                            f"maximum {max_depth}"
+                        ),
+                        severity=0.4,
+                        line_hint=f"depth={actual_depth}",
+                    )
+                )
+            return violations
+    except ImportError:
+        pass
+    except Exception as exc:
+        log.debug("AST nesting check failed, falling back to indent: %s", exc)
+
+    # Fallback: indent-counting heuristic
     lines = code.split("\n")
 
     for i, line in enumerate(lines):

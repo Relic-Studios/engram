@@ -1383,6 +1383,211 @@ def engram_project_init(
 
 
 # ===========================================================================
+# AST / Code Analysis Tools
+# ===========================================================================
+
+
+@mcp.tool()
+@_safe_json
+def engram_extract_symbols(
+    code: str,
+    language: str = "",
+    file_path: str = "",
+    store: bool = True,
+) -> str:
+    """Extract code symbols using AST analysis and optionally store them.
+
+    Runs tree-sitter (JS/TS) or stdlib ast (Python) parsing to extract
+    functions, classes, imports, complexity metrics, and anti-patterns
+    from source code.  Optionally stores the extracted symbols as a
+    trace for future retrieval.
+
+    This is the on-demand version of what happens automatically in the
+    after-pipeline (which extracts symbols from LLM response code blocks).
+
+    Args:
+        code: Source code to analyze.
+        language: Language hint (auto-detected if empty).
+        file_path: Optional file path for context.
+        store: If True, store extracted symbols as a code_symbols trace.
+    """
+    try:
+        from engram.extraction.ast_engine import analyze_code
+    except ImportError:
+        return json.dumps(
+            {"error": "AST extraction not available. Install tree-sitter."}
+        )
+
+    analysis = analyze_code(code, language)
+
+    result = analysis.to_dict()
+    result["repo_map"] = analysis.to_repo_map()
+    if file_path:
+        result["file_path"] = file_path
+
+    # Optionally store as a trace
+    if store and analysis.symbols:
+        system = _get_system()
+        content_parts = []
+        if file_path:
+            content_parts.append(f"# Symbols: {file_path}")
+        content_parts.append(analysis.to_repo_map())
+        if analysis.imports:
+            content_parts.append(
+                "\nImports: "
+                + ", ".join(i.module for i in analysis.imports if i.module)
+            )
+
+        tags = ["ast", "symbols"]
+        if file_path:
+            tags.append(file_path.split("/")[-1].split("\\")[-1])
+        if analysis.language != "unknown":
+            tags.append(analysis.language)
+
+        trace_id = system.episodic.log_trace(
+            content="\n".join(content_parts),
+            kind="code_symbols",
+            tags=tags,
+            salience=0.6,
+            project=_current_project,
+            file_path=file_path,
+            language=analysis.language,
+            fingerprint=analysis.fingerprint,
+            symbol_count=len(analysis.symbols),
+            import_count=len(analysis.imports),
+        )
+        result["trace_id"] = trace_id
+
+        # Auto-store wiring edges from imports
+        for imp in analysis.imports:
+            if imp.module and file_path:
+                try:
+                    system.episodic.add_relationship(
+                        subject=file_path,
+                        predicate="depends_on",
+                        object=imp.module,
+                        confidence=0.85,
+                        source_trace_id=trace_id,
+                    )
+                except Exception:
+                    pass  # Non-critical — don't fail on wiring
+
+        # Auto-store export edges
+        for sym in analysis.exported_symbols:
+            if file_path and sym.kind.value in ("function", "class", "interface"):
+                try:
+                    system.episodic.add_relationship(
+                        subject=file_path,
+                        predicate="exports",
+                        object=sym.qualified_name,
+                        confidence=0.95,
+                        source_trace_id=trace_id,
+                    )
+                except Exception:
+                    pass
+
+    return json.dumps(result, indent=2, default=str)
+
+
+@mcp.tool()
+@_safe_json
+def engram_repo_map(
+    directory: str = "",
+    max_tokens: int = 2000,
+    extensions: str = "",
+) -> str:
+    """Generate an Aider-style repo-map for a directory.
+
+    Indexes all supported source files in the directory using AST
+    extraction and produces a compact representation of the repository
+    structure showing file paths, class definitions, and function
+    signatures.  Ideal for providing project context to LLMs.
+
+    The map is automatically stored as a project_context trace for
+    future retrieval.
+
+    Args:
+        directory: Directory to scan. Defaults to current project root.
+        max_tokens: Approximate token budget for the map (default 2000).
+        extensions: Comma-separated file extensions (e.g., ".py,.ts").
+                    Defaults to common code extensions.
+    """
+    try:
+        from engram.extraction.symbol_index import SymbolIndex
+    except ImportError:
+        return json.dumps({"error": "Symbol index not available."})
+
+    import os
+
+    if not directory:
+        directory = os.getcwd()
+
+    if not os.path.isdir(directory):
+        return json.dumps({"error": f"Directory not found: {directory}"})
+
+    # Parse extensions
+    ext_set = None
+    if extensions:
+        ext_set = {
+            e.strip() if e.strip().startswith(".") else f".{e.strip()}"
+            for e in extensions.split(",")
+            if e.strip()
+        }
+
+    index = SymbolIndex()
+    file_count = index.index_directory(directory, extensions=ext_set)
+
+    repo_map = index.generate_repo_map(max_tokens=max_tokens)
+
+    # Store as project context trace
+    system = _get_system()
+    project_name = _current_project or os.path.basename(directory)
+
+    trace_id = system.episodic.log_trace(
+        content=f"# Repo Map: {project_name}\n\n{repo_map}",
+        kind="project_context",
+        tags=["repo_map", "ast", project_name],
+        salience=0.8,
+        project=_current_project,
+        directory=directory,
+        file_count=file_count,
+        symbol_count=index.symbol_count,
+    )
+
+    # Store dependency edges
+    edges = index.get_dependency_edges()
+    stored_edges = 0
+    for edge in edges[:200]:  # Cap at 200 edges to avoid flooding
+        try:
+            system.episodic.add_relationship(
+                subject=edge["source"],
+                predicate=edge["predicate"],
+                object=edge["target"],
+                confidence=0.85,
+                source_trace_id=trace_id,
+            )
+            stored_edges += 1
+        except Exception:
+            pass
+
+    return json.dumps(
+        {
+            "directory": directory,
+            "file_count": file_count,
+            "symbol_count": index.symbol_count,
+            "trace_id": trace_id,
+            "edges_stored": stored_edges,
+            "repo_map": repo_map,
+            "message": (
+                f"Indexed {file_count} files with {index.symbol_count} symbols. "
+                f"Stored {stored_edges} dependency edges."
+            ),
+        },
+        indent=2,
+    )
+
+
+# ===========================================================================
 # Maintenance Tools
 # ===========================================================================
 

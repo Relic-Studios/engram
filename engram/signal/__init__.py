@@ -2,8 +2,10 @@
 engram.signal — Code Quality Signal measurement, extraction, and adaptation.
 
 Public API:
-  measure()           — measure code quality signal (regex + optional LLM)
+  measure()           — measure code quality signal (regex + AST + optional LLM)
   measure_regex()     — regex-only CQS measurement
+  measure_ast()       — AST-based structural CQS measurement
+  blend_regex_ast()   — blend regex and AST signals
   extract()           — LLM-based semantic extraction
   SignalTracker       — rolling window signal analytics
   ReinforcementEngine — Hebbian salience adjustment
@@ -16,6 +18,8 @@ Public API:
 from engram.signal.measure import (
     measure,
     measure_regex,
+    measure_ast,
+    blend_regex_ast,
     check_correctness,
     check_consistency,
     check_completeness,
@@ -38,6 +42,8 @@ from engram.signal.style import (
 __all__ = [
     "measure",
     "measure_regex",
+    "measure_ast",
+    "blend_regex_ast",
     "check_correctness",
     "check_consistency",
     "check_completeness",

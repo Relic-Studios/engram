@@ -142,7 +142,27 @@ class IndexedSearch:
 
     @staticmethod
     def _sanitise_query(query: str) -> str:
-        """Wrap each term in double-quotes for safe FTS5 matching."""
+        """Expand compound identifiers and wrap terms for FTS5 matching.
+
+        First expands compound identifiers (camelCase, snake_case, etc.)
+        into their component words, then wraps each term in double-quotes
+        for safe FTS5 matching.
+
+        Examples:
+            "getUserById"     → '"getUserById" "get" "user" "by" "id"'
+            "snake_case func" → '"snake_case" "snake" "case" "func"'
+        """
+        if not query or not query.strip():
+            return '""'
+
+        # Expand compound identifiers before quoting
+        try:
+            from engram.search.tokenizer import expand_query
+
+            query = expand_query(query)
+        except ImportError:
+            pass  # tokenizer not available — use raw query
+
         terms = query.strip().split()
         if not terms:
             return '""'

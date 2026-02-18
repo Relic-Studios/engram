@@ -66,6 +66,7 @@ TRACE_KINDS = frozenset(
         "test_strategy",  # Testing approach for a module/feature
         "project_context",  # Project-level metadata snapshot
         "code_review",  # Observations from code review
+        "code_symbols",  # AST-extracted symbol index for a file/module
     }
 )
 
