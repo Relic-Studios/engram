@@ -36,6 +36,11 @@ def main(argv: list[str] | None = None) -> None:
         default="./engram_data",
         help="Data directory to create (default: ./engram_data)",
     )
+    init_p.add_argument(
+        "--core-person",
+        default="",
+        help="Name of the owner/core person (locked to highest trust tier)",
+    )
 
     # -- serve -------------------------------------------------------------
     serve_p = sub.add_parser("serve", help="Start the MCP server")
@@ -139,12 +144,19 @@ def _cmd_init(args: argparse.Namespace) -> None:
         )
 
     # Create template engram.yaml config
+    core_person = getattr(args, "core_person", "") or ""
     config_path = data_dir / "engram.yaml"
     if not config_path.exists():
+        core_line = (
+            f"  core_person: {core_person}\n"
+            if core_person
+            else "  core_person: ''         # set to your name to enable trust gating\n"
+        )
         config_path.write_text(
             "# Engram configuration\n"
             "engram:\n"
             f"  data_dir: {data_dir}\n"
+            f"{core_line}"
             "  signal_mode: hybrid     # hybrid | regex | llm\n"
             "  extract_mode: off       # llm | off\n"
             "  llm_provider: ollama    # ollama | openai | anthropic\n"
@@ -160,11 +172,17 @@ def _cmd_init(args: argparse.Namespace) -> None:
     print(f"  SOUL.md:         {soul_path}")
     print(f"  identities.yaml: {identities_path}")
     print(f"  engram.yaml:     {config_path}")
+    if core_person:
+        print(f"  Core person:     {core_person}")
     print()
     print("Next steps:")
     print("  1. Edit SOUL.md with your identity")
     print("  2. Add people to identities.yaml")
-    print("  3. Run: engram serve --data-dir", str(data_dir))
+    if not core_person:
+        print("  3. Set core_person in engram.yaml to your name")
+        print("  4. Run: engram serve --data-dir", str(data_dir))
+    else:
+        print("  3. Run: engram serve --data-dir", str(data_dir))
 
 
 def _cmd_serve(args: argparse.Namespace) -> None:

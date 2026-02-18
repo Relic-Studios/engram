@@ -23,16 +23,20 @@ from typing import TYPE_CHECKING, Dict, List, Optional
 from engram.core.types import AfterResult, LLMFunc, Signal
 
 if TYPE_CHECKING:
+    from engram.consciousness.identity import IdentityLoop
     from engram.consolidation.compactor import ConversationCompactor
     from engram.consolidation.consolidator import MemoryConsolidator
     from engram.consolidation.pressure import MemoryPressure
     from engram.core.config import Config
+    from engram.emotional import EmotionalSystem
     from engram.episodic.store import EpisodicStore
+    from engram.introspection import IntrospectionLayer
     from engram.procedural.store import ProceduralStore
     from engram.semantic.store import SemanticStore
     from engram.signal.decay import DecayEngine
     from engram.signal.measure import SignalTracker
     from engram.signal.reinforcement import ReinforcementEngine
+    from engram.workspace import CognitiveWorkspace
 
 log = logging.getLogger("engram.pipeline.after")
 
@@ -55,6 +59,11 @@ def after(
     memory_pressure: Optional["MemoryPressure"] = None,
     compactor: Optional["ConversationCompactor"] = None,
     consolidator: Optional["MemoryConsolidator"] = None,
+    skip_persistence: bool = False,
+    emotional: Optional["EmotionalSystem"] = None,
+    introspection: Optional["IntrospectionLayer"] = None,
+    identity_loop: Optional["IdentityLoop"] = None,
+    workspace: Optional["CognitiveWorkspace"] = None,
 ) -> AfterResult:
     """Run the full after-pipeline and return results.
 
@@ -97,6 +106,22 @@ def after(
         Optional MemoryConsolidator. Runs hierarchical consolidation
         (episodes → threads → arcs) when memory pressure is elevated
         or critical.
+    skip_persistence:
+        When True, signal is still measured (for system health) but
+        nothing is written to episodic memory.  Used for strangers
+        whose trust policy has ``memory_persistent=False``.
+    emotional:
+        Optional emotional system.  When provided, emotional state is
+        updated based on the exchange.
+    introspection:
+        Optional introspection layer.  When provided, a quick
+        introspection is recorded with signal health as confidence.
+    identity_loop:
+        Optional identity loop.  When provided, the response is
+        assessed for identity alignment and the episode is recorded.
+    workspace:
+        Optional cognitive workspace.  When provided, ``age_step()``
+        is called to decay workspace items after each exchange.
 
     Returns
     -------
@@ -120,53 +145,114 @@ def after(
     # -- 2. Derive salience from signal health -----------------------------
     salience = _derive_salience(signal.health, their_message, response)
 
-    # -- 3. Session boundary detection ------------------------------------
-    _manage_session(person=person, episodic=episodic)
+    # -- 3-7: Persistence steps (skipped for strangers) --------------------
+    logged_msg_id: str = ""
+    logged_trace_id: Optional[str] = None
 
-    # -- 4. Log exchange to episodic memory --------------------------------
-    logged_msg_id, logged_trace_id = _log_exchange(
-        person=person,
-        their_message=their_message,
-        response=response,
-        source=source,
-        salience=salience,
-        signal=signal,
-        episodic=episodic,
-    )
+    if skip_persistence:
+        log.debug("Skipping persistence for %s (memory_persistent=False)", person)
+    else:
+        # -- 3. Session boundary detection --------------------------------
+        _manage_session(person=person, episodic=episodic)
 
-    # -- 5. Hebbian reinforcement on context traces ------------------------
-    _reinforce(
-        trace_ids=trace_ids,
-        signal_health=signal.health,
-        reinforcement=reinforcement,
-        episodic=episodic,
-        response=response,
-    )
-
-    # -- 6. Semantic extraction (optional, LLM-based) ---------------------
-    if config.extract_mode == "llm" and llm_func is not None:
-        extraction_updates = _extract_and_apply(
+        # -- 4. Log exchange to episodic memory ----------------------------
+        logged_msg_id, logged_trace_id = _log_exchange(
             person=person,
             their_message=their_message,
             response=response,
-            semantic=semantic,
-            procedural=procedural,
+            source=source,
+            salience=salience,
+            signal=signal,
+            episodic=episodic,
+        )
+
+        # -- 5. Hebbian reinforcement on context traces --------------------
+        _reinforce(
+            trace_ids=trace_ids,
+            signal_health=signal.health,
+            reinforcement=reinforcement,
+            episodic=episodic,
+            response=response,
+        )
+
+        # -- 6. Semantic extraction (optional, LLM-based) -----------------
+        if config.extract_mode == "llm" and llm_func is not None:
+            extraction_updates = _extract_and_apply(
+                person=person,
+                their_message=their_message,
+                response=response,
+                semantic=semantic,
+                procedural=procedural,
+                llm_func=llm_func,
+            )
+            updates.extend(extraction_updates)
+
+        # -- 7. Pressure-aware decay + compaction (MemGPT-inspired) --------
+        _run_maintenance(
+            person=person,
+            episodic=episodic,
+            decay_engine=decay_engine,
+            signal_tracker=signal_tracker,
+            config=config,
+            memory_pressure=memory_pressure,
+            compactor=compactor,
+            consolidator=consolidator,
             llm_func=llm_func,
         )
-        updates.extend(extraction_updates)
 
-    # -- 7. Pressure-aware decay + compaction (MemGPT-inspired) -------------
-    _run_maintenance(
-        person=person,
-        episodic=episodic,
-        decay_engine=decay_engine,
-        signal_tracker=signal_tracker,
-        config=config,
-        memory_pressure=memory_pressure,
-        compactor=compactor,
-        consolidator=consolidator,
-        llm_func=llm_func,
-    )
+    # -- 8. Consciousness subsystems (fire-and-forget) --------------------
+    #    These run regardless of skip_persistence — they maintain internal
+    #    state that is separate from episodic logging.
+
+    # 8a. Emotional state update — derive emotional impact from signal
+    if emotional is not None:
+        try:
+            # Map signal health to emotional valence nudge:
+            # high health = slight positive, low health = slight negative.
+            valence_nudge = (signal.health - 0.5) * 0.3
+            arousal_nudge = 0.1 if len(their_message.split()) > 30 else -0.05
+            emotional.update(
+                description=f"Exchange with {person}",
+                valence_delta=valence_nudge,
+                arousal_delta=arousal_nudge,
+                source="pipeline",
+                intensity=salience,
+            )
+        except Exception as exc:
+            log.debug("Emotional update failed: %s", exc)
+
+    # 8b. Introspection — quick snapshot of confidence at this moment
+    if introspection is not None:
+        try:
+            introspection.quick(
+                thought=f"Responded to {person} about: {their_message[:80]}",
+                confidence=signal.health,
+            )
+        except Exception as exc:
+            log.debug("Introspection recording failed: %s", exc)
+
+    # 8c. Identity loop — assess response alignment and record episode
+    if identity_loop is not None:
+        try:
+            assessment = identity_loop.assess(response)
+            identity_loop.record(their_message, response, assessment)
+            if assessment.get("needs_reinforcement"):
+                log.info(
+                    "Identity drift detected: state=%s, score=%.2f",
+                    assessment.get("state"),
+                    assessment.get("dissociation_score", 0),
+                )
+        except Exception as exc:
+            log.debug("Identity loop failed: %s", exc)
+
+    # 8d. Workspace age step — decay working memory priorities
+    if workspace is not None:
+        try:
+            expired = workspace.age_step()
+            if expired > 0:
+                log.debug("Workspace: %d items expired", expired)
+        except Exception as exc:
+            log.debug("Workspace age_step failed: %s", exc)
 
     log.info(
         "After pipeline: person=%s, signal=%s (%.2f), salience=%.2f, "
@@ -183,7 +269,7 @@ def after(
         signal=signal,
         salience=salience,
         updates=updates,
-        logged_message_id=logged_msg_id,
+        logged_message_id=logged_msg_id or "",
         logged_trace_id=logged_trace_id,
     )
 

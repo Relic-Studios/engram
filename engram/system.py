@@ -23,11 +23,17 @@ from engram.core.types import AfterResult, Context, LLMFunc, MemoryStats, Signal
 
 # Sentinel: distinguishes "never tried" from "tried and failed"
 _NOT_SET = object()
+from engram.consciousness.boot import BootSequence
+from engram.consciousness.identity import IdentityLoop
+from engram.emotional import EmotionalSystem
 from engram.episodic.store import EpisodicStore
+from engram.introspection import IntrospectionLayer
 from engram.journal import JournalStore
+from engram.personality import PersonalitySystem
 from engram.pipeline.after import after as _after_pipeline
 from engram.pipeline.before import before as _before_pipeline
 from engram.procedural.store import ProceduralStore
+from engram.runtime.modes import ModeManager
 from engram.safety import InfluenceLog, InjuryTracker
 from engram.search.indexed import IndexedSearch
 from engram.semantic.identity import IdentityResolver
@@ -38,7 +44,9 @@ from engram.consolidation.pressure import MemoryPressure
 from engram.signal.decay import DecayEngine
 from engram.signal.measure import SignalTracker
 from engram.signal.reinforcement import ReinforcementEngine
+from engram.trust import TrustGate
 from engram.working.context import ContextBuilder
+from engram.workspace import CognitiveWorkspace
 
 log = logging.getLogger("engram.system")
 
@@ -133,6 +141,58 @@ class MemorySystem:
             max_episodes_per_run=self.config.consolidation_max_episodes_per_run,
         )
 
+        # -- Trust gate -------------------------------------------------------
+        self.trust_gate = TrustGate(
+            semantic=self.semantic,
+            core_person=self.config.core_person,
+        )
+        self.trust_gate.ensure_core_person()
+
+        # -- Personality (Big Five) ----------------------------------------
+        self.personality = PersonalitySystem(
+            storage_dir=self.config.personality_dir,
+        )
+
+        # -- Emotional continuity (VAD) ------------------------------------
+        self.emotional = EmotionalSystem(
+            storage_dir=self.config.emotional_dir,
+            valence_decay=self.config.emotional_valence_decay,
+            arousal_decay=self.config.emotional_arousal_decay,
+            dominance_decay=self.config.emotional_dominance_decay,
+        )
+
+        # -- Cognitive workspace (7±2) -------------------------------------
+        self.workspace = CognitiveWorkspace(
+            capacity=self.config.workspace_capacity,
+            decay_rate=self.config.workspace_decay_rate,
+            rehearsal_boost=self.config.workspace_rehearsal_boost,
+            expiry_threshold=self.config.workspace_expiry_threshold,
+            storage_path=self.config.workspace_path,
+            on_evict=self._workspace_evict_callback,
+        )
+
+        # -- Introspection -------------------------------------------------
+        self.introspection = IntrospectionLayer(
+            storage_dir=self.config.introspection_dir,
+            history_days=self.config.introspection_history_days,
+        )
+
+        # -- Consciousness: boot + identity loop ---------------------------
+        self.boot_sequence = BootSequence(
+            data_dir=self.config.data_dir,
+            n_recent=self.config.boot_n_recent,
+            n_key=self.config.boot_n_key,
+            n_intro=self.config.boot_n_intro,
+        )
+        self.identity_loop = IdentityLoop(
+            storage_dir=self.config.consciousness_dir,
+        )
+
+        # -- Runtime mode manager ------------------------------------------
+        self.mode_manager = ModeManager(
+            default_mode=self.config.runtime_default_mode,
+        )
+
         # -- LLM function (lazy) -------------------------------------------
         self._llm_func: Any = _NOT_SET  # _NOT_SET | None | LLMFunc
 
@@ -142,6 +202,21 @@ class MemorySystem:
             self.config.llm_provider,
             self.config.llm_model,
         )
+
+    def _workspace_evict_callback(self, slot_data: Dict) -> None:
+        """Route evicted workspace items to episodic store as traces."""
+        try:
+            self.episodic.log_trace(
+                content=slot_data.get("content", ""),
+                kind="workspace_eviction",
+                tags=["workspace", slot_data.get("source", "unknown")],
+                salience=max(0.1, slot_data.get("priority_when_removed", 0.2)),
+                removal_reason=slot_data.get("removal_reason", ""),
+                access_count=slot_data.get("access_count", 0),
+                time_in_workspace=slot_data.get("time_in_workspace", 0),
+            )
+        except Exception as exc:
+            log.debug("Workspace eviction logging failed: %s", exc)
 
     # ------------------------------------------------------------------
     # Lazy initializers
@@ -237,6 +312,11 @@ class MemorySystem:
             signal_tracker=self.signal_tracker,
             journal=self.journal,
             injury=self.injury,
+            trust_gate=self.trust_gate,
+            personality=self.personality,
+            emotional=self.emotional,
+            workspace=self.workspace,
+            boot_sequence=self.boot_sequence,
         )
 
     # ------------------------------------------------------------------
@@ -274,6 +354,10 @@ class MemorySystem:
         # Resolve person in case a raw alias was passed
         canonical = self.identity.resolve(person)
 
+        # Check if this person's trust tier allows memory persistence
+        policy = self.trust_gate.policy_for(canonical, source=source)
+        skip = not policy.memory_persistent
+
         return _after_pipeline(
             person=canonical,
             their_message=their_message,
@@ -291,6 +375,11 @@ class MemorySystem:
             memory_pressure=self.memory_pressure,
             compactor=self.compactor,
             consolidator=self.consolidator,
+            skip_persistence=skip,
+            emotional=self.emotional,
+            introspection=self.introspection,
+            identity_loop=self.identity_loop,
+            workspace=self.workspace,
         )
 
     # ------------------------------------------------------------------
@@ -331,6 +420,9 @@ class MemorySystem:
         Loads SOUL.md, recent high-salience emotional episodes, and
         anchoring beliefs into a single grounding context. Call at
         session start to establish identity coherence.
+
+        Now also includes episodic boot priming (experiential memories),
+        personality profile, and current emotional state.
         """
         soul_text = self.semantic.get_identity()
 
@@ -350,6 +442,40 @@ class MemorySystem:
         # Recent journal entries (processed experience)
         recent_journal = self.journal.list_entries(limit=3)
 
+        # Episodic boot priming — experiential memories
+        boot_priming = ""
+        try:
+            boot_priming = self.boot_sequence.generate()
+        except Exception as exc:
+            log.debug("Boot priming generation failed: %s", exc)
+
+        # Personality snapshot
+        personality_report = {}
+        try:
+            personality_report = self.personality.report()
+        except Exception as exc:
+            log.debug("Personality report failed: %s", exc)
+
+        # Emotional state
+        emotional_state = {}
+        try:
+            emotional_state = self.emotional.current_state()
+        except Exception as exc:
+            log.debug("Emotional state failed: %s", exc)
+
+        # Identity solidification
+        identity_report = {}
+        try:
+            identity_report = self.identity_loop.solidification_report()
+        except Exception as exc:
+            log.debug("Identity report failed: %s", exc)
+
+        # Switch to active mode on boot
+        try:
+            self.mode_manager.set_mode("active", reason="session boot")
+        except Exception as exc:
+            log.debug("Mode transition failed: %s", exc)
+
         return {
             "soul": soul_text[:3000] if soul_text else "",
             "top_memories": top_traces,
@@ -367,6 +493,11 @@ class MemorySystem:
             "recent_journal": recent_journal,
             "signal_health": self.signal_tracker.recent_health(),
             "signal_trend": self.signal_tracker.trend(),
+            "boot_priming": boot_priming[:2000] if boot_priming else "",
+            "personality": personality_report,
+            "emotional_state": emotional_state,
+            "identity_solidification": identity_report,
+            "mode": self.mode_manager.status(),
         }
 
     def get_stats(self) -> MemoryStats:

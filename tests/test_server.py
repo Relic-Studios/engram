@@ -24,12 +24,19 @@ def server_system(config_with_soul):
     system = MemorySystem(config=cfg)
 
     # Inject into server module's global
-    old = server_mod._system
+    old_system = server_mod._system
+    old_source = server_mod._current_source
+    old_person = server_mod._current_person
     server_mod._system = system
+    # Default to core person / direct source so tests run with full access
+    server_mod._current_source = "direct"
+    server_mod._current_person = "tester"
 
     yield system
 
-    server_mod._system = old
+    server_mod._system = old_system
+    server_mod._current_source = old_source
+    server_mod._current_person = old_person
     system.close()
 
 

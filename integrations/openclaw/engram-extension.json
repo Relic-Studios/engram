@@ -20,24 +20,29 @@
       "engram_boot",
       "engram_search",
       "engram_recall",
+      "engram_recall_time",
       "engram_stats",
       "engram_signal",
       "engram_add_fact",
       "engram_add_skill",
       "engram_log_event",
       "engram_trust_check",
+      "engram_remember",
+      "engram_forget",
+      "engram_reflect",
+      "engram_correct",
+      "engram_preferences_search",
+      "engram_journal_list"
+    ],
+    "deny_from_external": [
       "engram_trust_promote",
       "engram_influence_log",
       "engram_injury_log",
       "engram_injury_status",
       "engram_boundary_add",
-      "engram_contradiction_add",
-      "engram_preferences_add",
-      "engram_preferences_search",
-      "engram_journal_write",
-      "engram_journal_list",
       "engram_reindex"
-    ]
+    ],
+    "note": "Tools in deny_from_external are blocked by TrustGate when source != 'direct'. Write tools (engram_add_fact, engram_add_skill, etc.) require at least friend trust from external sources."
   },
 
   "hooks": {
@@ -60,7 +65,7 @@
   "setup": {
     "steps": [
       "Install engram: pip install engram",
-      "Initialize data: engram init --data-dir /path/to/memory",
+      "Initialize data: engram init --data-dir /path/to/memory --core-person yourname",
       "Edit SOUL.md with your identity",
       "Add people to identities.yaml",
       "Copy skills/engram-memory/ to ~/.openclaw/skills/",

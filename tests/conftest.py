@@ -27,7 +27,13 @@ def config(tmp_dir):
 
 @pytest.fixture
 def config_with_soul(config):
-    """Config with a SOUL.md and identities.yaml pre-populated."""
+    """Config with a SOUL.md, identities.yaml, and trust.yaml pre-populated.
+
+    Sets ``core_person="tester"`` so the trust gate is active, and
+    pre-registers alice as a friend and bob as an acquaintance in both
+    identity and trust files.
+    """
+    config.core_person = "tester"
     config.soul_path.write_text(
         "# Test Identity\n\nI am a test agent. I value honesty and curiosity.\n\n"
         "## Core Values\n- Honesty\n- Curiosity\n- Directness\n",
@@ -41,6 +47,24 @@ def config_with_soul(config):
         "  bob:\n"
         "    aliases: [bobby, Robert]\n"
         "    trust_tier: acquaintance\n",
+        encoding="utf-8",
+    )
+    # Pre-populate trust.yaml so TrustGate resolves tiers correctly.
+    # Without this, SemanticStore.check_trust() returns "stranger" for everyone.
+    # Note: SemanticStore expects data nested under a "tiers" key.
+    trust_path = config.semantic_dir / "trust.yaml"
+    trust_path.parent.mkdir(parents=True, exist_ok=True)
+    trust_path.write_text(
+        "tiers:\n"
+        "  alice:\n"
+        "    tier: friend\n"
+        "    reason: Test fixture\n"
+        "  bob:\n"
+        "    tier: acquaintance\n"
+        "    reason: Test fixture\n"
+        "  tester:\n"
+        "    tier: core\n"
+        "    reason: Owner — registered at initialization\n",
         encoding="utf-8",
     )
     return config

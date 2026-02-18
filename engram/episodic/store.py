@@ -10,7 +10,7 @@ import json
 import math
 import uuid
 from pathlib import Path
-from typing import List, Optional, Dict
+from typing import Any, List, Optional, Dict
 from datetime import datetime, timezone
 
 
@@ -192,6 +192,12 @@ class EpisodicStore:
         **metadata,
     ) -> str:
         """Record an experiential trace (summary, insight, reflection). Returns trace ID."""
+        from engram.core.types import TRACE_KINDS
+
+        if kind not in TRACE_KINDS:
+            raise ValueError(
+                f"Invalid trace kind {kind!r}. Must be one of {sorted(TRACE_KINDS)}"
+            )
         trace_id = _generate_id()
         now = _now()
         tokens = max(
@@ -798,6 +804,82 @@ class EpisodicStore:
                 (until, since, limit),
             ).fetchall()
         return [self._row_to_dict(r) for r in rows]
+
+    # ── Trace-kind queries (temporal, utility, etc.) ─────────
+
+    def get_traces_by_kind(
+        self,
+        kind: str,
+        limit: int = 50,
+        min_salience: float = 0.0,
+    ) -> List[Dict]:
+        """Retrieve traces of a specific kind (temporal, utility, etc.).
+
+        Metadata is automatically deserialized so callers can access
+        temporal decay/revival data or utility Q-values directly.
+        """
+        rows = self.conn.execute(
+            """
+            SELECT * FROM traces
+            WHERE kind = ? AND salience >= ?
+            ORDER BY salience DESC
+            LIMIT ?
+            """,
+            (kind, min_salience, limit),
+        ).fetchall()
+        return [self._row_to_dict(r) for r in rows]
+
+    def get_traces_with_metadata(
+        self,
+        metadata_key: str,
+        limit: int = 50,
+    ) -> List[Dict]:
+        """Retrieve traces where metadata contains a specific key.
+
+        Uses SQLite ``json_extract`` for efficient filtering.
+        Useful for finding all traces with temporal decay data,
+        utility Q-values, belief scores, etc.
+        """
+        rows = self.conn.execute(
+            """
+            SELECT * FROM traces
+            WHERE json_extract(metadata, ?) IS NOT NULL
+            ORDER BY salience DESC
+            LIMIT ?
+            """,
+            (f"$.{metadata_key}", limit),
+        ).fetchall()
+        return [self._row_to_dict(r) for r in rows]
+
+    def update_trace_metadata(
+        self,
+        trace_id: str,
+        key: str,
+        value: Any,
+    ) -> bool:
+        """Update a single key in a trace's metadata JSON.
+
+        Creates the metadata JSON if it doesn't exist.
+        Returns True if the trace was found and updated.
+        """
+        row = self.conn.execute(
+            "SELECT metadata FROM traces WHERE id = ?", (trace_id,)
+        ).fetchone()
+        if row is None:
+            return False
+        existing = {}
+        if row[0]:
+            try:
+                existing = json.loads(row[0])
+            except (json.JSONDecodeError, TypeError):
+                existing = {}
+        existing[key] = value
+        self.conn.execute(
+            "UPDATE traces SET metadata = ? WHERE id = ?",
+            (json.dumps(existing), trace_id),
+        )
+        self.conn.commit()
+        return True
 
     # ── Internal ──────────────────────────────────────────────
 

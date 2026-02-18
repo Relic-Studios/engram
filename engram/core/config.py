@@ -34,6 +34,9 @@ class Config:
     # -- storage ------------------------------------------------------------
     data_dir: Path = field(default_factory=lambda: Path("./engram_data"))
 
+    # -- trust / identity ---------------------------------------------------
+    core_person: str = ""  # canonical name of the owner (auto-registered as core tier)
+
     # -- signal / extraction modes ------------------------------------------
     signal_mode: str = "hybrid"  # "hybrid" | "regex" | "llm"
     extract_mode: str = "off"  # "llm" | "off"
@@ -80,6 +83,42 @@ class Config:
     consolidation_min_threads: int = 3  # min threads before arc creation
     consolidation_max_episodes_per_run: int = 200  # cap per consolidation pass
 
+    # -- Big Five personality defaults (thomas-soul defaults) ----------------
+    personality_openness: float = 0.8
+    personality_conscientiousness: float = 0.6
+    personality_extraversion: float = 0.3
+    personality_agreeableness: float = 0.8
+    personality_neuroticism: float = 0.5
+
+    # -- VAD emotional continuity -------------------------------------------
+    emotional_valence_decay: float = 0.9  # per hour toward neutral
+    emotional_arousal_decay: float = 0.7  # per hour toward 0.5
+    emotional_dominance_decay: float = 0.8  # per hour toward 0.5
+
+    # -- cognitive workspace (Miller's Law 7±2) -----------------------------
+    workspace_capacity: int = 7
+    workspace_decay_rate: float = 0.95
+    workspace_rehearsal_boost: float = 0.15
+    workspace_expiry_threshold: float = 0.1
+
+    # -- introspection / meta-consciousness ---------------------------------
+    introspection_default_depth: str = "moderate"  # "surface" | "moderate" | "deep"
+    introspection_history_days: int = 3  # days of JSONL history to load
+
+    # -- consciousness boot sequence ----------------------------------------
+    boot_n_recent: int = 2  # recent emotional events to load
+    boot_n_key: int = 2  # key realizations to load
+    boot_n_intro: int = 1  # introspections to load
+
+    # -- runtime mode settings (scaffold) -----------------------------------
+    runtime_default_mode: str = (
+        "quiet_presence"  # quiet_presence | active | deep_work | sleep
+    )
+    runtime_quiet_check_interval: int = 60  # seconds
+    runtime_active_check_interval: int = 1
+    runtime_deep_work_check_interval: int = 30
+    runtime_sleep_check_interval: int = 300
+
     # -----------------------------------------------------------------------
     # Derived paths (all relative to data_dir)
     # -----------------------------------------------------------------------
@@ -111,6 +150,30 @@ class Config:
     @property
     def identities_path(self) -> Path:
         return self.semantic_dir / "identities.yaml"
+
+    @property
+    def personality_dir(self) -> Path:
+        return self.data_dir / "personality"
+
+    @property
+    def emotional_dir(self) -> Path:
+        return self.data_dir / "emotional"
+
+    @property
+    def introspection_dir(self) -> Path:
+        return self.data_dir / "introspection"
+
+    @property
+    def workspace_path(self) -> Path:
+        return self.data_dir / "workspace.json"
+
+    @property
+    def consciousness_dir(self) -> Path:
+        return self.data_dir / "consciousness"
+
+    @property
+    def runtime_dir(self) -> Path:
+        return self.data_dir / "runtime"
 
     # -----------------------------------------------------------------------
     # Construction helpers
@@ -167,6 +230,11 @@ class Config:
             self.semantic_dir,
             self.procedural_dir,
             self.embeddings_dir,
+            self.personality_dir,
+            self.emotional_dir,
+            self.introspection_dir,
+            self.consciousness_dir,
+            self.runtime_dir,
         ):
             d.mkdir(parents=True, exist_ok=True)
 
@@ -324,6 +392,7 @@ class Config:
         """Serialise to a plain dict (YAML/JSON-safe, no callables)."""
         return {
             "data_dir": str(self.data_dir),
+            "core_person": self.core_person,
             "signal_mode": self.signal_mode,
             "extract_mode": self.extract_mode,
             "llm_provider": self.llm_provider,
@@ -352,4 +421,23 @@ class Config:
             "consolidation_time_window_hours": self.consolidation_time_window_hours,
             "consolidation_min_threads": self.consolidation_min_threads,
             "consolidation_max_episodes_per_run": self.consolidation_max_episodes_per_run,
+            # consciousness integration
+            "personality_openness": self.personality_openness,
+            "personality_conscientiousness": self.personality_conscientiousness,
+            "personality_extraversion": self.personality_extraversion,
+            "personality_agreeableness": self.personality_agreeableness,
+            "personality_neuroticism": self.personality_neuroticism,
+            "emotional_valence_decay": self.emotional_valence_decay,
+            "emotional_arousal_decay": self.emotional_arousal_decay,
+            "emotional_dominance_decay": self.emotional_dominance_decay,
+            "workspace_capacity": self.workspace_capacity,
+            "workspace_decay_rate": self.workspace_decay_rate,
+            "workspace_rehearsal_boost": self.workspace_rehearsal_boost,
+            "workspace_expiry_threshold": self.workspace_expiry_threshold,
+            "introspection_default_depth": self.introspection_default_depth,
+            "introspection_history_days": self.introspection_history_days,
+            "boot_n_recent": self.boot_n_recent,
+            "boot_n_key": self.boot_n_key,
+            "boot_n_intro": self.boot_n_intro,
+            "runtime_default_mode": self.runtime_default_mode,
         }

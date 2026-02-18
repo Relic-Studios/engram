@@ -82,3 +82,9 @@ unreal_mcp.log
 
 # Internal notes
 CODEGRAM_CONVERSION.md
+
+# Windows artifacts
+nul
+
+# Legacy memory_system data
+memory_system/

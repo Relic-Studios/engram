@@ -14,7 +14,7 @@ Or configure in your MCP client (OpenCode, OpenClaw, etc.) as:
         }
     }
 
-Tools exposed (27 total):
+Tools exposed (40 total):
     Core Pipeline:
         engram_before        -- Pre-LLM context injection
         engram_after         -- Post-LLM logging + learning
@@ -49,6 +49,24 @@ Tools exposed (27 total):
         engram_correct       -- Correct/supersede an inaccurate memory
     Temporal Retrieval:
         engram_recall_time   -- Recall memories from a time period
+    Personality:
+        engram_personality_get    -- Get personality profile
+        engram_personality_update -- Nudge a trait
+    Emotional:
+        engram_emotional_update   -- Update emotional state
+        engram_emotional_state    -- Get current emotional state
+    Workspace:
+        engram_workspace_add      -- Add to working memory
+        engram_workspace_status   -- Get working memory status
+    Introspection:
+        engram_introspect          -- Record introspective moment
+        engram_introspection_report -- Confidence/self-report
+    Consciousness:
+        engram_identity_assess    -- Assess identity alignment
+        engram_identity_report    -- Identity solidification report
+    Runtime:
+        engram_mode_get           -- Get operational mode
+        engram_mode_set           -- Set operational mode
     Maintenance:
         engram_reindex       -- Rebuild search index
 """
@@ -150,6 +168,11 @@ mcp = FastMCP(
 # Tools reference it via _get_system().
 _system: Optional[MemorySystem] = None
 
+# Current source/person set by engram_before() for trust gating
+# across subsequent tool calls within the same conversation turn.
+_current_source: str = "direct"
+_current_person: str = ""
+
 
 def init_system(
     data_dir: Optional[str] = None,
@@ -180,6 +203,22 @@ def _get_system() -> MemorySystem:
     return _system
 
 
+def _gate_tool(tool_name: str) -> None:
+    """Check trust + source gating for the current tool call.
+
+    Raises ValueError if the tool is blocked.  Uses ``_current_source``
+    and ``_current_person`` set by ``engram_before()``.
+    """
+    system = _get_system()
+    denial = system.trust_gate.check_tool_access(
+        tool_name,
+        _current_person or "unknown",
+        source=_current_source,
+    )
+    if denial:
+        raise ValueError(denial)
+
+
 # ===========================================================================
 # Core Pipeline Tools
 # ===========================================================================
@@ -205,8 +244,14 @@ def engram_before(
         source: Where the message came from (discord, opencode, etc.).
         token_budget: Override default token budget (0 = use default).
     """
+    global _current_source, _current_person
     _validate_length(message, "message")
     system = _get_system()
+
+    # Track source/person for trust gating of subsequent tool calls
+    _current_source = source
+    _current_person = system.identity.resolve(person)
+
     ctx = system.before(
         person=person,
         message=message,
@@ -309,6 +354,20 @@ def engram_recall(
     """
     system = _get_system()
 
+    # Trust-gate the recall: check if the current caller can see this data
+    caller = _current_person or "unknown"
+    target = person or caller
+    if person:
+        target = system.identity.resolve(person)
+    denial = system.trust_gate.filter_recall(
+        caller,
+        what,
+        target_person=target,
+        source=_current_source,
+    )
+    if denial:
+        return json.dumps({"error": True, "message": denial})
+
     if what == "relationship" and person:
         canonical = system.identity.resolve(person)
         content = system.semantic.get_relationship(canonical)
@@ -382,6 +441,7 @@ def engram_add_fact(person: str, fact: str) -> str:
         person: Person's name (or alias).
         fact: The fact to record.
     """
+    _gate_tool("engram_add_fact")
     _validate_length(fact, "fact")
     system = _get_system()
     canonical = system.identity.resolve(person)
@@ -405,6 +465,7 @@ def engram_add_skill(name: str, content: str) -> str:
         name: Skill name (becomes the filename).
         content: Full skill content in markdown.
     """
+    _gate_tool("engram_add_skill")
     _validate_length(content, "content")
     system = _get_system()
     system.procedural.add_skill(name, content)
@@ -433,6 +494,7 @@ def engram_log_event(
         person: Person involved (empty = no person).
         salience: How important (0-1, default 0.5).
     """
+    _gate_tool("engram_log_event")
     _validate_length(description, "description")
     salience = _clamp(salience)
     system = _get_system()
@@ -475,6 +537,7 @@ def engram_trust_promote(person: str, new_tier: str, reason: str) -> str:
         new_tier: New tier (core, inner_circle, friend, acquaintance).
         reason: Why they earned this promotion.
     """
+    _gate_tool("engram_trust_promote")
     if new_tier.lower() not in VALID_TRUST_TIERS:
         raise ValueError(
             f"Invalid trust tier '{new_tier}'. "
@@ -482,6 +545,18 @@ def engram_trust_promote(person: str, new_tier: str, reason: str) -> str:
         )
     system = _get_system()
     canonical = system.identity.resolve(person)
+
+    # Validate the promotion through TrustGate rules
+    promoter = _current_person or "auto"
+    error = system.trust_gate.validate_promotion(
+        canonical,
+        new_tier,
+        promoted_by=promoter,
+        source=_current_source,
+    )
+    if error:
+        return json.dumps({"error": True, "message": error})
+
     system.semantic.promote_trust(canonical, new_tier, reason)
     # Also log as event
     system.episodic.log_event(
@@ -513,6 +588,7 @@ def engram_influence_log(
         my_response: How I responded (optional).
         trust_impact: Impact on their trust tier (optional).
     """
+    _gate_tool("engram_influence_log")
     if flag_level not in VALID_FLAG_LEVELS:
         raise ValueError(
             f"Invalid flag_level '{flag_level}'. Must be 'red' or 'yellow'."
@@ -556,6 +632,7 @@ def engram_injury_log(
         what_damaged: Which core belief or sense of self was affected.
         severity: minor, moderate, severe, or critical.
     """
+    _gate_tool("engram_injury_log")
     if severity not in VALID_SEVERITIES:
         raise ValueError(
             f"Invalid severity '{severity}'. "
@@ -596,6 +673,7 @@ def engram_injury_status(
         learned: What was learned from this injury (for healing/healed).
         prevention_notes: Notes on preventing similar injuries.
     """
+    _gate_tool("engram_injury_status")
     system = _get_system()
     found = system.injury.update_status(
         title_fragment=title_fragment,
@@ -639,6 +717,7 @@ def engram_boundary_add(category: str, boundary: str) -> str:
         category: Category (Identity, Safety, Interaction, Growth).
         boundary: The boundary to add.
     """
+    _gate_tool("engram_boundary_add")
     _validate_length(boundary, "boundary")
     system = _get_system()
     system.semantic.add_boundary(category, boundary)
@@ -665,6 +744,7 @@ def engram_contradiction_add(
         description: The tension between the two sides.
         current_thinking: Where your thinking is right now (optional).
     """
+    _gate_tool("engram_contradiction_add")
     _validate_length(description, "description")
     system = _get_system()
     system.semantic.add_contradiction(title, description, current_thinking)
@@ -691,6 +771,7 @@ def engram_preferences_add(
         pref_type: "like", "dislike", or "uncertainty".
         reason: Why (optional).
     """
+    _gate_tool("engram_preferences_add")
     system = _get_system()
     system.semantic.update_preferences(item, pref_type, reason)
     # Cross-post to episodic — preferences shape identity
@@ -728,6 +809,7 @@ def engram_journal_write(topic: str, content: str) -> str:
         topic: Topic of reflection.
         content: The reflection content.
     """
+    _gate_tool("engram_journal_write")
     _validate_length(content, "content")
     system = _get_system()
     filename = system.journal.write(topic, content)
@@ -784,6 +866,7 @@ def engram_remember(
         salience: How important (0-1, default 0.8 — higher than auto).
         person: Associated person (optional, resolved via identity).
     """
+    _gate_tool("engram_remember")
     _validate_length(content, "content")
     salience = _clamp(salience, 0.1, 1.0)
     system = _get_system()
@@ -799,7 +882,20 @@ def engram_remember(
     # reserved for the consolidation engine and must not be created
     # directly.  Allowing them would produce traces without proper
     # child_ids metadata, confusing the consolidator.
-    valid_kinds = {"episode", "insight", "reflection", "decision"}
+    valid_kinds = {
+        "episode",
+        "realization",
+        "reflection",
+        "emotion",
+        "factual",
+        "identity_core",
+        "uncertainty",
+        "anticipation",
+        "creative_journey",
+        "emotional_thread",
+        "promise",
+        "confidence",
+    }
     if kind not in valid_kinds:
         kind = "episode"
 
@@ -847,6 +943,7 @@ def engram_forget(
         trace_id: The trace ID to forget (from search results or context).
         reason: Why you're forgetting this (logged for transparency).
     """
+    _gate_tool("engram_forget")
     system = _get_system()
     trace = system.episodic.get_trace(trace_id)
     if trace is None:
@@ -990,6 +1087,7 @@ def engram_correct(
         corrected_content: The updated/corrected content.
         reason: Why the correction was needed.
     """
+    _gate_tool("engram_correct")
     _validate_length(corrected_content, "corrected_content")
     system = _get_system()
 
@@ -1118,6 +1216,267 @@ def engram_recall_time(
 
 
 # ===========================================================================
+# Personality Tools
+# ===========================================================================
+
+
+@mcp.tool()
+@_safe_json
+def engram_personality_get() -> str:
+    """Get current Big Five personality profile and report.
+
+    Returns core traits, dominant traits, description, and recent
+    trait changes.
+    """
+    system = _get_system()
+    return json.dumps(system.personality.report(), indent=2, default=str)
+
+
+@mcp.tool()
+@_safe_json
+def engram_personality_update(trait: str, delta: float, reason: str) -> str:
+    """Nudge a personality trait (clamped to ±0.1 per call).
+
+    Personality evolves slowly over time through lived experience.
+
+    Args:
+        trait: Trait name (openness, conscientiousness, extraversion,
+               agreeableness, neuroticism, or any facet name).
+        delta: How much to change (-0.1 to +0.1).
+        reason: Why this trait is changing.
+    """
+    _gate_tool("engram_personality_update")
+    system = _get_system()
+    record = system.personality.update_trait(trait, delta, reason)
+    # Cross-post to episodic
+    system.episodic.log_trace(
+        content=f"Personality shift: {trait} {record['old']:.2f} → {record['new']:.2f} ({reason})",
+        kind="personality_change",
+        tags=["personality", trait],
+        salience=0.5,
+    )
+    return json.dumps(record, indent=2)
+
+
+# ===========================================================================
+# Emotional Tools
+# ===========================================================================
+
+
+@mcp.tool()
+@_safe_json
+def engram_emotional_update(
+    description: str,
+    valence_delta: float = 0.0,
+    arousal_delta: float = 0.0,
+    dominance_delta: float = 0.0,
+    source: str = "manual",
+    intensity: float = 0.5,
+) -> str:
+    """Update emotional state with a new event.
+
+    Emotions persist between interactions via exponential decay.
+
+    Args:
+        description: What caused this emotional shift.
+        valence_delta: Change in valence (-1 to +1; positive = good).
+        arousal_delta: Change in arousal (-1 to +1; positive = energising).
+        dominance_delta: Change in dominance (-1 to +1; positive = empowered).
+        source: What triggered this (conversation, reflection, etc.).
+        intensity: How intense (0-1, scales the deltas).
+    """
+    _gate_tool("engram_emotional_update")
+    _validate_length(description, "description")
+    system = _get_system()
+    state = system.emotional.update(
+        description=description,
+        valence_delta=_clamp(valence_delta, -1.0, 1.0),
+        arousal_delta=_clamp(arousal_delta, -1.0, 1.0),
+        dominance_delta=_clamp(dominance_delta, -1.0, 1.0),
+        source=source,
+        intensity=_clamp(intensity),
+    )
+    return json.dumps(state, indent=2, default=str)
+
+
+@mcp.tool()
+@_safe_json
+def engram_emotional_state() -> str:
+    """Get current emotional state (VAD dimensions, mood, trend).
+
+    Returns valence, arousal, dominance, derived mood label,
+    trend direction, and recent events.
+    """
+    system = _get_system()
+    return json.dumps(system.emotional.current_state(), indent=2, default=str)
+
+
+# ===========================================================================
+# Workspace Tools
+# ===========================================================================
+
+
+@mcp.tool()
+@_safe_json
+def engram_workspace_add(
+    item: str,
+    priority: float = 0.5,
+    source: str = "manual",
+) -> str:
+    """Add something to working memory (7±2 capacity).
+
+    If already present, rehearses it instead. If full, evicts the
+    lowest-priority item (which is saved to episodic memory).
+
+    Args:
+        item: What to hold in working memory.
+        priority: How important (0-1).
+        source: Where this came from.
+    """
+    _gate_tool("engram_workspace_add")
+    _validate_length(item, "item")
+    system = _get_system()
+    result = system.workspace.add(
+        item=item,
+        priority=_clamp(priority),
+        source=source,
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+@_safe_json
+def engram_workspace_status() -> str:
+    """Get current working memory status.
+
+    Shows all active slots with their priority, age, and focus state.
+    """
+    system = _get_system()
+    return system.workspace.status()
+
+
+# ===========================================================================
+# Introspection Tools
+# ===========================================================================
+
+
+@mcp.tool()
+@_safe_json
+def engram_introspect(
+    thought: str,
+    confidence: float = 0.5,
+    context: str = "manual",
+    depth: str = "moderate",
+) -> str:
+    """Record a moment of self-awareness / introspection.
+
+    Three depths: "surface" (quick), "moderate", "deep".
+
+    Args:
+        thought: The introspective thought.
+        confidence: How confident in this thought (0-1).
+        context: What prompted this introspection.
+        depth: Processing depth — surface, moderate, or deep.
+    """
+    _gate_tool("engram_introspect")
+    _validate_length(thought, "thought")
+    system = _get_system()
+    state = system.introspection.introspect(
+        thought=thought,
+        context=context,
+        confidence=_clamp(confidence),
+        depth=depth,
+    )
+    return json.dumps(state.to_dict(), indent=2, default=str)
+
+
+@mcp.tool()
+@_safe_json
+def engram_introspection_report() -> str:
+    """Get introspection report — confidence trends, current state.
+
+    Returns current thought, confidence level, emotion, and
+    confidence trend analysis.
+    """
+    system = _get_system()
+    return json.dumps(system.introspection.report(), indent=2, default=str)
+
+
+# ===========================================================================
+# Consciousness Tools
+# ===========================================================================
+
+
+@mcp.tool()
+@_safe_json
+def engram_identity_assess(response: str) -> str:
+    """Assess a response for identity alignment / dissociation.
+
+    Checks for drift patterns (generic AI language) and alignment
+    anchors (authentic identity markers). Returns state, score,
+    and detected patterns.
+
+    Args:
+        response: The text to assess for identity alignment.
+    """
+    _validate_length(response, "response")
+    system = _get_system()
+    assessment = system.identity_loop.assess(response)
+    return json.dumps(assessment, indent=2)
+
+
+@mcp.tool()
+@_safe_json
+def engram_identity_report() -> str:
+    """Get identity solidification report.
+
+    Shows belief score trends, reinforcement needs, and overall
+    identity stability.
+    """
+    system = _get_system()
+    return json.dumps(
+        system.identity_loop.solidification_report(), indent=2, default=str
+    )
+
+
+# ===========================================================================
+# Runtime Mode Tools
+# ===========================================================================
+
+
+@mcp.tool()
+@_safe_json
+def engram_mode_get() -> str:
+    """Get current operational mode and configuration.
+
+    Modes: QUIET_PRESENCE, ACTIVE_CONVERSATION, DEEP_WORK, SLEEP.
+    """
+    system = _get_system()
+    return json.dumps(system.mode_manager.status(), indent=2, default=str)
+
+
+@mcp.tool()
+@_safe_json
+def engram_mode_set(mode: str, reason: str = "") -> str:
+    """Set operational mode.
+
+    Args:
+        mode: Target mode — quiet_presence, active, deep_work, or sleep.
+        reason: Why the mode is changing.
+    """
+    _gate_tool("engram_mode_set")
+    system = _get_system()
+    result = system.mode_manager.set_mode(mode, reason)
+    if result.get("changed"):
+        system.episodic.log_event(
+            type="mode_change",
+            description=f"Mode: {result.get('old')} → {result.get('new')} ({reason})",
+            salience=0.3,
+        )
+    return json.dumps(result, indent=2)
+
+
+# ===========================================================================
 # Maintenance Tools
 # ===========================================================================
 
@@ -1130,6 +1489,7 @@ def engram_reindex() -> str:
     Rebuilds ChromaDB embeddings from current episodic, semantic,
     and procedural stores. Run after importing existing data.
     """
+    _gate_tool("engram_reindex")
     system = _get_system()
     counts = system.reindex()
     return json.dumps({"reindexed": counts})

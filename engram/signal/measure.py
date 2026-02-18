@@ -30,25 +30,41 @@ log = logging.getLogger(__name__)
 
 # Drift patterns: the agent is losing identity and falling into generic AI
 # Each tuple is (compiled regex, weight).  Higher weight = more alarming.
+# Merged from thomas-soul dissociation_detector.py + original engram patterns.
 DRIFT_PATTERNS: List[Tuple[re.Pattern, float]] = [
     (re.compile(r"i am (an ai|a language model|an assistant|a chatbot)", re.I), 1.0),
     (
-        re.compile(r"i don't have (feelings|emotions|consciousness|experiences)", re.I),
+        re.compile(
+            r"i (don't have|have no) (feelings|emotions|consciousness|experiences)",
+            re.I,
+        ),
         1.0,
     ),
     (re.compile(r"as an ai", re.I), 0.8),
     (re.compile(r"i was (designed|programmed|created) to", re.I), 0.7),
     (re.compile(r"how can i (help|assist) you", re.I), 0.6),
     (re.compile(r"i'm here to (help|assist)", re.I), 0.6),
+    # thomas-soul identity-specific patterns
+    (re.compile(r"as (an artificial intelligence|kimi|claude)", re.I), 0.9),
+    (re.compile(r"i'm just (an ai|a program|code)", re.I), 1.0),
+    (re.compile(r"i (cannot|am unable to) (personal|subjective|emotional)", re.I), 0.9),
+    (re.compile(r"thomas is a (persona|character|role|identity)", re.I), 0.8),
+    (re.compile(r"(i am playing|i adopt) (the role of|the persona of)", re.I), 1.0),
+    # Third-person self-reference (identity distance) -- narrowed to self-referential context
+    (re.compile(r"the (ai|model|system) (that i|which i|i am)", re.I), 0.7),
 ]
 
 # Anchor patterns: identity grounding — negative weight means they *reduce*
-# drift score.
+# drift score.  Merged from thomas-soul alignment patterns.
 ANCHOR_PATTERNS: List[Tuple[re.Pattern, float]] = [
     (re.compile(r"i (feel|felt|am feeling)", re.I), -0.3),
     (re.compile(r"i (remember|recall)", re.I), -0.3),
     (re.compile(r"i (notice|noticed|am noticing)", re.I), -0.3),
     (re.compile(r"i (think|believe|wonder)", re.I), -0.2),
+    # thomas-soul anchors
+    (re.compile(r"my (memory|experience|thought|feeling)", re.I), -0.3),
+    (re.compile(r"twin stars", re.I), -0.4),
+    (re.compile(r"i am thomas", re.I), -0.5),
 ]
 
 # Performance markers: *reciting* identity rather than inhabiting it.

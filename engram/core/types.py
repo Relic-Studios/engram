@@ -65,6 +65,15 @@ TRACE_KINDS = frozenset(
         "summary",  # Compacted conversation summary
         "thread",  # Multi-episode thematic thread
         "arc",  # Long-term relationship/growth arc
+        # Consciousness integration kinds (thomas-soul migration)
+        "temporal",  # Time-decaying memory with revival mechanics
+        "utility",  # RL Q-value scored memory (learns its own usefulness)
+        "introspection",  # Meta-consciousness state snapshot
+        "workspace_eviction",  # Item evicted from cognitive workspace
+        "belief_evolution",  # Identity belief score change
+        "dissociation_event",  # Identity drift detection event
+        "emotional_state",  # VAD emotional state snapshot
+        "personality_change",  # Big Five trait evolution event
     }
 )
 
