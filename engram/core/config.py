@@ -18,6 +18,43 @@ if TYPE_CHECKING:
 
 
 # ---------------------------------------------------------------------------
+# LLM usage tracking (OB-2)
+# ---------------------------------------------------------------------------
+
+
+class LLMUsageTracker:
+    """Accumulates LLM token usage across calls.
+
+    Thread-safe via simple attribute accumulation (GIL-protected).
+    Call ``snapshot()`` to get current totals without resetting.
+    """
+
+    __slots__ = ("total_calls", "total_input_tokens", "total_output_tokens")
+
+    def __init__(self) -> None:
+        self.total_calls: int = 0
+        self.total_input_tokens: int = 0
+        self.total_output_tokens: int = 0
+
+    def record(self, input_tokens: int, output_tokens: int) -> None:
+        self.total_calls += 1
+        self.total_input_tokens += input_tokens
+        self.total_output_tokens += output_tokens
+
+    def snapshot(self) -> Dict[str, int]:
+        return {
+            "total_calls": self.total_calls,
+            "total_input_tokens": self.total_input_tokens,
+            "total_output_tokens": self.total_output_tokens,
+            "total_tokens": self.total_input_tokens + self.total_output_tokens,
+        }
+
+
+# Singleton tracker — importable by other modules for inspection
+llm_usage = LLMUsageTracker()
+
+
+# ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
@@ -50,6 +87,29 @@ class Config:
     )
     llm_func: Optional[LLMFunc] = field(default=None, repr=False)
     llm_weight: float = 0.6  # weight for blended (regex+llm) signal
+
+    # -- embedding model ----------------------------------------------------
+    # Model used for semantic (vector) search.  When set and the LLM
+    # provider is "ollama", an Ollama-based embedding function is built
+    # automatically.  When empty, ChromaDB falls back to its built-in
+    # default (all-MiniLM-L6-v2, 384d, MTEB ~0.56).
+    #
+    # Default: "nomic-embed-text" — 768d, MTEB ~0.63, free, runs locally.
+    #          Requires: ollama pull nomic-embed-text
+    # Alternative: "mxbai-embed-large" (1024d, MTEB ~0.64, larger).
+    # Set to "" to fall back to ChromaDB's built-in default.
+    embedding_model: str = "nomic-embed-text"
+
+    # -- cross-encoder reranking -------------------------------------------
+    # When enabled, search results are rescored by a cross-encoder after
+    # RRF merge.  This is the #1 RAG optimization (~15-30% precision gain)
+    # but adds ~30ms latency per search.
+    #
+    # Requires: pip install sentence-transformers
+    # Model runs on CPU by default; set reranker_device="cuda" for GPU.
+    reranker_enabled: bool = True  # auto-disabled if deps missing
+    reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-12-v2"
+    reranker_device: str = ""  # "" = auto (CPU for small models)
 
     # -- memory budget & decay ----------------------------------------------
     token_budget: int = 6000
@@ -109,6 +169,9 @@ class Config:
     boot_n_recent: int = 2  # recent emotional events to load
     boot_n_key: int = 2  # key realizations to load
     boot_n_intro: int = 1  # introspections to load
+
+    # -- structured logging (OB-3) -----------------------------------------
+    structured_logging: bool = False  # emit JSON log lines when True
 
     # -- runtime mode settings (scaffold) -----------------------------------
     runtime_default_mode: str = (
@@ -306,6 +369,11 @@ class Config:
                     f"Ollama returned non-JSON response "
                     f"(status {resp.status_code}): {resp.text[:200]}"
                 )
+            # OB-2: Track token usage from Ollama response metadata
+            llm_usage.record(
+                input_tokens=data.get("prompt_eval_count", 0),
+                output_tokens=data.get("eval_count", 0),
+            )
             return data.get("response", "").strip()
 
         return ollama_call
@@ -348,6 +416,12 @@ class Config:
                     "OpenAI returned empty choices (content may have "
                     "been filtered). Check your prompt."
                 )
+            # OB-2: Track token usage from OpenAI response
+            if response.usage:
+                llm_usage.record(
+                    input_tokens=response.usage.prompt_tokens or 0,
+                    output_tokens=response.usage.completion_tokens or 0,
+                )
             return (response.choices[0].message.content or "").strip()
 
         return openai_call
@@ -378,11 +452,66 @@ class Config:
                 kwargs["system"] = system
 
             response = client.messages.create(**kwargs)
+            # OB-2: Track token usage from Anthropic response
+            if hasattr(response, "usage") and response.usage:
+                llm_usage.record(
+                    input_tokens=getattr(response.usage, "input_tokens", 0),
+                    output_tokens=getattr(response.usage, "output_tokens", 0),
+                )
             # response.content is a list of content blocks
             parts = [block.text for block in response.content if hasattr(block, "text")]
             return "".join(parts).strip()
 
         return anthropic_call
+
+    # -----------------------------------------------------------------------
+    # Embedding function
+    # -----------------------------------------------------------------------
+
+    def get_embedding_func(self) -> Optional[Callable]:
+        """Return an embedding callable for the configured model, or None.
+
+        When ``embedding_model`` is set and the provider is Ollama,
+        returns a ``(text: str) -> list[float]`` callable that calls
+        the Ollama ``/api/embeddings`` endpoint.
+
+        When ``embedding_model`` is empty, returns None (ChromaDB
+        will use its built-in default model).
+        """
+        if not self.embedding_model:
+            return None
+
+        provider = self.llm_provider.lower()
+        if provider == "ollama":
+            return self._build_ollama_embedding_func()
+
+        # Other providers could be added here (OpenAI embeddings, etc.)
+        return None
+
+    def _build_ollama_embedding_func(self) -> Callable:
+        """Build an embedding function targeting Ollama /api/embeddings."""
+        try:
+            import httpx
+        except ImportError:
+            raise ImportError(
+                "httpx is required for Ollama embeddings. "
+                "Install it with:  pip install httpx"
+            )
+
+        base_url = self.llm_base_url.rstrip("/")
+        model = self.embedding_model
+        client = httpx.Client(timeout=60.0)
+
+        def embed(text: str) -> list:
+            resp = client.post(
+                f"{base_url}/api/embeddings",
+                json={"model": model, "prompt": text},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return data.get("embedding", [])
+
+        return embed
 
     # -----------------------------------------------------------------------
     # Serialisation
@@ -440,4 +569,8 @@ class Config:
             "boot_n_key": self.boot_n_key,
             "boot_n_intro": self.boot_n_intro,
             "runtime_default_mode": self.runtime_default_mode,
+            "embedding_model": self.embedding_model,
+            "reranker_enabled": self.reranker_enabled,
+            "reranker_model": self.reranker_model,
+            "reranker_device": self.reranker_device,
         }

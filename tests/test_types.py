@@ -18,7 +18,12 @@ class TestHelpers:
     def test_estimate_tokens(self):
         assert estimate_tokens("") == 1  # min 1
         assert estimate_tokens("hello world") >= 1
-        assert estimate_tokens("a" * 400) == 100
+        # Prose should give reasonable estimates (not exact — depends
+        # on whether tiktoken is installed or heuristic mode is used)
+        prose = "The quick brown fox jumps over the lazy dog. " * 10
+        est = estimate_tokens(prose)
+        assert est >= 50  # ~100 words → at least 50 tokens
+        assert est <= 200  # ... but not wildly over
 
     def test_generate_id(self):
         id1 = generate_id()

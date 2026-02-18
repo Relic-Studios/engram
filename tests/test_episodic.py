@@ -137,3 +137,103 @@ class TestEpisodicStore:
 
         with EpisodicStore(config.db_path) as store:
             store.log_message(person="x", speaker="x", content="x", source="x")
+
+    def test_batch_writes(self, episodic):
+        """Batch context defers commits until exit."""
+        with episodic.batch():
+            episodic.log_message(
+                person="alice", speaker="alice", content="batch1", source="test"
+            )
+            episodic.log_trace(content="batch trace", kind="episode", tags=[])
+            episodic.reinforce("traces", "nonexistent", 0.1)  # no-op but no error
+        # After batch: data should be committed
+        assert episodic.count_messages() >= 1
+        assert episodic.count_traces() >= 1
+
+    def test_batch_nesting(self, episodic):
+        """Nested batches only commit on outermost exit."""
+        with episodic.batch():
+            episodic.log_message(
+                person="alice", speaker="alice", content="outer", source="test"
+            )
+            with episodic.batch():
+                episodic.log_message(
+                    person="alice", speaker="alice", content="inner", source="test"
+                )
+            # Inner batch exits but outer is still active — no commit yet
+            assert episodic._batch_depth == 1
+        # Outermost exits — commit
+        assert episodic._batch_depth == 0
+        assert episodic.count_messages() >= 2
+
+
+class TestRelationshipGraph:
+    def test_add_relationship(self, episodic):
+        rel_id = episodic.add_relationship("Thomas", "created_by", "Aidan")
+        assert len(rel_id) == 12
+
+    def test_duplicate_returns_existing(self, episodic):
+        id1 = episodic.add_relationship("Thomas", "likes", "Python", confidence=0.7)
+        id2 = episodic.add_relationship("Thomas", "likes", "Python", confidence=0.9)
+        assert id1 == id2
+        # Confidence should be updated to max
+        rels = episodic.get_relationships("Thomas", predicate="likes")
+        assert rels[0]["confidence"] == 0.9
+
+    def test_get_relationships_outgoing(self, episodic):
+        episodic.add_relationship("Thomas", "knows", "Aidan")
+        episodic.add_relationship("Thomas", "uses", "Python")
+        episodic.add_relationship("Aidan", "created", "Engram")
+
+        rels = episodic.get_relationships("Thomas", direction="outgoing")
+        assert len(rels) == 2
+        subjects = {r["subject"] for r in rels}
+        assert subjects == {"Thomas"}
+
+    def test_get_relationships_incoming(self, episodic):
+        episodic.add_relationship("Thomas", "knows", "Aidan")
+        episodic.add_relationship("Bob", "knows", "Aidan")
+
+        rels = episodic.get_relationships("Aidan", direction="incoming")
+        assert len(rels) == 2
+
+    def test_get_relationships_both(self, episodic):
+        episodic.add_relationship("Thomas", "knows", "Aidan")
+        episodic.add_relationship("Aidan", "created", "Engram")
+
+        rels = episodic.get_relationships("Aidan", direction="both")
+        assert len(rels) == 2
+
+    def test_invalidate_relationship(self, episodic):
+        rel_id = episodic.add_relationship("Thomas", "dislikes", "bugs")
+        episodic.invalidate_relationship(rel_id)
+
+        # Should not appear in active relationships
+        rels = episodic.get_relationships("Thomas", include_expired=False)
+        assert len(rels) == 0
+
+        # Should appear when including expired
+        rels = episodic.get_relationships("Thomas", include_expired=True)
+        assert len(rels) == 1
+        assert rels[0]["valid_until"] is not None
+
+    def test_entity_graph_1hop(self, episodic):
+        episodic.add_relationship("Thomas", "knows", "Aidan")
+        episodic.add_relationship("Thomas", "uses", "Python")
+        episodic.add_relationship("Aidan", "created", "Engram")
+
+        graph = episodic.get_entity_graph("Thomas", hops=1)
+        assert len(graph) == 2  # Thomas→Aidan, Thomas→Python
+
+    def test_entity_graph_2hop(self, episodic):
+        episodic.add_relationship("Thomas", "knows", "Aidan")
+        episodic.add_relationship("Aidan", "created", "Engram")
+
+        graph = episodic.get_entity_graph("Thomas", hops=2)
+        assert len(graph) == 2  # Thomas→Aidan, Aidan→Engram
+
+    def test_count_relationships(self, episodic):
+        assert episodic.count_relationships() == 0
+        episodic.add_relationship("A", "knows", "B")
+        episodic.add_relationship("B", "knows", "C")
+        assert episodic.count_relationships() == 2

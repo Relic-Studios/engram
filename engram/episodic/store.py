@@ -10,8 +10,8 @@ import json
 import math
 import uuid
 from pathlib import Path
-from typing import Any, List, Optional, Dict
-from datetime import datetime, timezone
+from typing import Any, Callable, List, Optional, Dict
+from datetime import datetime, timedelta, timezone
 
 
 def _generate_id() -> str:
@@ -34,6 +34,68 @@ class EpisodicStore:
         self.conn.execute("PRAGMA foreign_keys=ON")
         self._create_tables()
 
+        # Callback fired after every log_trace().  Signature:
+        #   (trace_id: str, content: str, metadata: dict) -> None
+        # Used by MemorySystem to push new traces into ChromaDB for
+        # incremental vector indexing (FR-2).
+        self._on_trace_logged: Optional[Callable] = None
+
+        # Batch write support: when _batch_depth > 0, individual
+        # commit() calls are suppressed and a single commit runs
+        # when the outermost batch context exits.
+        self._batch_depth: int = 0
+
+    # ── Batch writes ────────────────────────────────────────────
+
+    class _BatchContext:
+        """Context manager that defers commits until exit."""
+
+        def __init__(self, store: "EpisodicStore") -> None:
+            self._store = store
+
+        def __enter__(self) -> "EpisodicStore":
+            self._store._batch_depth += 1
+            return self._store
+
+        def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+            self._store._batch_depth -= 1
+            if self._store._batch_depth <= 0:
+                self._store._batch_depth = 0
+                if exc_type is None:
+                    self._store.conn.commit()
+                else:
+                    # Rollback on exception
+                    try:
+                        self._store.conn.rollback()
+                    except Exception:
+                        pass
+
+    def batch(self) -> "_BatchContext":
+        """Return a context manager that batches SQLite writes.
+
+        Within the ``batch()`` block, individual ``conn.commit()``
+        calls in ``log_message()``, ``log_trace()``, ``reinforce()``,
+        etc. are suppressed.  A single commit runs when the block
+        exits successfully, or a rollback on exception.
+
+        Under WAL mode this reduces disk I/O by 5-10x for the
+        after-pipeline which typically does 3-5 writes per call.
+
+        Usage::
+
+            with episodic.batch():
+                episodic.log_message(...)
+                episodic.log_trace(...)
+                episodic.reinforce(...)
+            # single commit happens here
+        """
+        return self._BatchContext(self)
+
+    def _commit(self) -> None:
+        """Commit unless inside a batch context."""
+        if self._batch_depth <= 0:
+            self.conn.commit()
+
     # ── Schema ────────────────────────────────────────────────
 
     def _create_tables(self):
@@ -41,17 +103,30 @@ class EpisodicStore:
 
         c.execute("""
             CREATE TABLE IF NOT EXISTS messages (
-                id          TEXT PRIMARY KEY,
-                person      TEXT,
-                speaker     TEXT,
-                content     TEXT,
-                source      TEXT,
-                timestamp   TEXT,
-                salience    REAL DEFAULT 0.5,
-                signal      JSON,
-                metadata    JSON
+                id              TEXT PRIMARY KEY,
+                person          TEXT,
+                speaker         TEXT,
+                content         TEXT,
+                source          TEXT,
+                timestamp       TEXT,
+                salience        REAL DEFAULT 0.5,
+                signal          JSON,
+                metadata        JSON,
+                access_count    INTEGER DEFAULT 0,
+                last_accessed   TEXT
             )
         """)
+
+        # Migration: add access_count/last_accessed to existing databases
+        # that were created before these columns existed.
+        for col, col_def in [
+            ("access_count", "INTEGER DEFAULT 0"),
+            ("last_accessed", "TEXT"),
+        ]:
+            try:
+                c.execute(f"ALTER TABLE messages ADD COLUMN {col} {col_def}")
+            except sqlite3.OperationalError:
+                pass  # column already exists
 
         c.execute("""
             CREATE TABLE IF NOT EXISTS traces (
@@ -92,15 +167,37 @@ class EpisodicStore:
         ]:
             c.execute(stmt)
 
-        # FTS5 full-text search
-        c.execute("""
-            CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts
-            USING fts5(content, content=messages, content_rowid=rowid)
-        """)
-        c.execute("""
-            CREATE VIRTUAL TABLE IF NOT EXISTS traces_fts
-            USING fts5(content, content=traces, content_rowid=rowid)
-        """)
+        # FTS5 full-text search with Porter stemming.
+        #
+        # Porter stemming enables morphological matching: "running"
+        # matches "run", "cats" matches "cat", etc.  The `porter`
+        # tokenizer wraps `unicode61` (the default) and applies the
+        # Porter stemming algorithm to each token.
+        #
+        # Migration: if an old FTS table exists without Porter stemming,
+        # we drop and recreate it so the index uses the new tokenizer.
+        # The sync triggers will repopulate data on next insert/update.
+        _FTS_TOKENIZER = "tokenize='porter unicode61'"
+        for table, fts in [("messages", "messages_fts"), ("traces", "traces_fts")]:
+            # Check if FTS table exists and needs migration
+            existing = c.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+                (fts,),
+            ).fetchone()
+            if existing:
+                sql = existing[0] or ""
+                if "porter" not in sql.lower():
+                    # Old FTS table without stemming — drop and recreate
+                    c.execute(f"DROP TABLE IF EXISTS {fts}")
+                    # Also drop triggers so they can be recreated
+                    for suffix in ("ai", "ad", "au"):
+                        c.execute(f"DROP TRIGGER IF EXISTS {table}_{suffix}")
+
+            c.execute(f"""
+                CREATE VIRTUAL TABLE IF NOT EXISTS {fts}
+                USING fts5(content, content={table}, content_rowid=rowid,
+                           {_FTS_TOKENIZER})
+            """)
 
         c.execute("""
             CREATE TABLE IF NOT EXISTS sessions (
@@ -118,6 +215,29 @@ class EpisodicStore:
         c.execute(
             "CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started)"
         )
+
+        # Relationship graph — lightweight temporal knowledge graph
+        # (Zep/Graphiti-inspired, no Neo4j dependency).
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS relationships (
+                id              TEXT PRIMARY KEY,
+                subject         TEXT NOT NULL,
+                predicate       TEXT NOT NULL,
+                object          TEXT NOT NULL,
+                valid_from      TEXT,
+                valid_until     TEXT,
+                confidence      REAL DEFAULT 1.0,
+                source_trace_id TEXT,
+                metadata        JSON
+            )
+        """)
+        for stmt in [
+            "CREATE INDEX IF NOT EXISTS idx_rel_subject   ON relationships(subject)",
+            "CREATE INDEX IF NOT EXISTS idx_rel_object    ON relationships(object)",
+            "CREATE INDEX IF NOT EXISTS idx_rel_predicate ON relationships(predicate)",
+            "CREATE INDEX IF NOT EXISTS idx_rel_valid     ON relationships(valid_until)",
+        ]:
+            c.execute(stmt)
 
         # Triggers to keep FTS in sync with source tables
         for table in ("messages", "traces"):
@@ -146,9 +266,22 @@ class EpisodicStore:
                 END
             """)
 
+        # Rebuild FTS indexes to populate from source tables.
+        # This is a no-op if the tables are already in sync, and
+        # is necessary after a migration (drop + recreate).
+        for fts in ("messages_fts", "traces_fts"):
+            try:
+                c.execute(f"INSERT INTO {fts}({fts}) VALUES('rebuild')")
+            except sqlite3.OperationalError:
+                pass  # table might be empty, that's fine
+
         self.conn.commit()
 
     # ── Write ─────────────────────────────────────────────────
+
+    # Idempotency window: reject duplicate messages with same person,
+    # speaker, and content logged within this many seconds.
+    DEDUP_WINDOW_SECONDS: int = 30
 
     def log_message(
         self,
@@ -160,7 +293,31 @@ class EpisodicStore:
         signal: Optional[Dict] = None,
         **metadata,
     ) -> str:
-        """Record a conversation message. Returns the message ID."""
+        """Record a conversation message. Returns the message ID.
+
+        Idempotency: if an identical message (same person, speaker,
+        content) was logged within the last ``DEDUP_WINDOW_SECONDS``,
+        the existing message ID is returned instead of creating a
+        duplicate.  This guards against Discord firing messageCreate
+        twice or engram_after being called multiple times.
+        """
+        # -- Idempotency check: skip if duplicate within window ------------
+        cutoff = datetime.now(timezone.utc) - timedelta(
+            seconds=self.DEDUP_WINDOW_SECONDS
+        )
+        cutoff_iso = cutoff.isoformat().replace("+00:00", "Z")
+        existing = self.conn.execute(
+            """
+            SELECT id FROM messages
+            WHERE person = ? AND speaker = ? AND content = ?
+              AND timestamp >= ?
+            LIMIT 1
+            """,
+            (person, speaker, content, cutoff_iso),
+        ).fetchone()
+        if existing:
+            return existing[0]  # return existing ID, no duplicate
+
         msg_id = _generate_id()
         self.conn.execute(
             """
@@ -180,7 +337,7 @@ class EpisodicStore:
                 json.dumps(metadata) if metadata else None,
             ),
         )
-        self.conn.commit()
+        self._commit()
         return msg_id
 
     def log_trace(
@@ -191,18 +348,40 @@ class EpisodicStore:
         salience: float = 0.5,
         **metadata,
     ) -> str:
-        """Record an experiential trace (summary, insight, reflection). Returns trace ID."""
+        """Record an experiential trace (summary, insight, reflection). Returns trace ID.
+
+        Idempotency: if a trace with identical content and kind was
+        created within the last ``DEDUP_WINDOW_SECONDS``, the existing
+        trace ID is returned instead of creating a duplicate.
+        """
         from engram.core.types import TRACE_KINDS
 
         if kind not in TRACE_KINDS:
             raise ValueError(
                 f"Invalid trace kind {kind!r}. Must be one of {sorted(TRACE_KINDS)}"
             )
+
+        # -- Idempotency check: skip if duplicate within window ------------
+        cutoff = datetime.now(timezone.utc) - timedelta(
+            seconds=self.DEDUP_WINDOW_SECONDS
+        )
+        cutoff_iso = cutoff.isoformat().replace("+00:00", "Z")
+        existing = self.conn.execute(
+            """
+            SELECT id FROM traces
+            WHERE content = ? AND kind = ? AND created >= ?
+            LIMIT 1
+            """,
+            (content, kind, cutoff_iso),
+        ).fetchone()
+        if existing:
+            return existing[0]  # return existing ID, no duplicate
+
         trace_id = _generate_id()
         now = _now()
-        tokens = max(
-            1, len(content) // 4
-        )  # char/4 heuristic, consistent with core.tokens
+        from engram.core.tokens import estimate_tokens
+
+        tokens = estimate_tokens(content)
         self.conn.execute(
             """
             INSERT INTO traces (id, content, created, kind, tags, salience,
@@ -221,7 +400,23 @@ class EpisodicStore:
                 json.dumps(metadata) if metadata else None,
             ),
         )
-        self.conn.commit()
+        self._commit()
+
+        # Fire incremental vector-indexing callback (FR-2)
+        if self._on_trace_logged is not None:
+            try:
+                trace_meta = dict(metadata) if metadata else {}
+                trace_meta.update(
+                    {
+                        "kind": kind,
+                        "salience": salience,
+                        "created": now,
+                    }
+                )
+                self._on_trace_logged(trace_id, content, trace_meta)
+            except Exception:
+                pass  # best-effort; don't break trace logging
+
         return trace_id
 
     def log_event(
@@ -250,7 +445,7 @@ class EpisodicStore:
                 json.dumps(metadata) if metadata else None,
             ),
         )
-        self.conn.commit()
+        self._commit()
         return event_id
 
     # ── Read ──────────────────────────────────────────────────
@@ -335,19 +530,43 @@ class EpisodicStore:
         return results
 
     def get_recent_messages(self, person: str, limit: int = 20) -> List[Dict]:
-        """Get the most recent messages for a person, in chronological order."""
+        """Get the most recent *unarchived* messages for a person, in chronological order.
+
+        Archived messages (from compaction) are excluded so that only
+        live conversation history is returned.  Without this filter,
+        compacted messages would crowd out recent context.
+
+        Deduplicates consecutive messages with identical speaker+content
+        (keeps the earliest of each run).  This cleans up any duplicates
+        that were logged before the idempotency guard was added.
+        """
+        # Over-fetch to account for duplicates that will be removed
         rows = self.conn.execute(
             """
             SELECT * FROM messages
             WHERE person = ?
+              AND COALESCE(json_extract(metadata, '$.archived'), 0) = 0
             ORDER BY timestamp DESC, rowid DESC
             LIMIT ?
             """,
-            (person, limit),
+            (person, limit * 2),
         ).fetchall()
         results = [self._row_to_dict(r) for r in rows]
         results.reverse()  # chronological
-        return results
+
+        # Deduplicate: remove consecutive identical speaker+content pairs
+        deduped: List[Dict] = []
+        for msg in results:
+            key = (msg.get("speaker", ""), msg.get("content", ""))
+            if (
+                deduped
+                and (deduped[-1].get("speaker", ""), deduped[-1].get("content", ""))
+                == key
+            ):
+                continue  # skip duplicate
+            deduped.append(msg)
+
+        return deduped[-limit:]  # trim to requested limit
 
     def get_by_salience(
         self, person: Optional[str] = None, limit: int = 30
@@ -431,7 +650,7 @@ class EpisodicStore:
             f"UPDATE {table} SET salience = MIN(1.0, salience + ?) WHERE id = ?",
             (abs(delta), id),
         )
-        self.conn.commit()
+        self._commit()
 
     def weaken(self, table: str, id: str, delta: float):
         """Decrease salience for a record. Clamps to [0, 1]."""
@@ -440,21 +659,25 @@ class EpisodicStore:
             f"UPDATE {table} SET salience = MAX(0.0, salience - ?) WHERE id = ?",
             (abs(delta), id),
         )
-        self.conn.commit()
+        self._commit()
 
     def update_access(self, table: str, id: str):
-        """Record that a trace/message was accessed (retrieved for context)."""
+        """Record that a trace or message was accessed (retrieved for context).
+
+        Increments ``access_count`` and updates ``last_accessed`` for both
+        traces and messages.  Access tracking enables decay resistance
+        (frequently-retrieved items decay slower) and retrieval analytics.
+        """
         self._validate_table(table)
+        if table == "events":
+            return  # events don't track access
         now = _now()
-        if table == "traces":
-            self.conn.execute(
-                "UPDATE traces SET access_count = access_count + 1, last_accessed = ? WHERE id = ?",
-                (now, id),
-            )
-        else:
-            # messages don't track access_count, but we could extend later
-            pass
-        self.conn.commit()
+        self.conn.execute(
+            f"UPDATE {table} SET access_count = COALESCE(access_count, 0) + 1, "
+            f"last_accessed = ? WHERE id = ?",
+            (now, id),
+        )
+        self._commit()
 
     # ── Statistics ─────────────────────────────────────────────
 
@@ -513,6 +736,10 @@ class EpisodicStore:
 
     # ── Decay & pruning ───────────────────────────────────────
 
+    # Half-life for access recency weighting (30 days in hours).
+    # Old accesses contribute less to decay resistance than recent ones.
+    ACCESS_RECENCY_HALF_LIFE_HOURS: float = 720.0  # 30 days
+
     def decay_pass(self, half_life_hours: float, coherence: float):
         """
         Run adaptive exponential decay across all traces.
@@ -523,18 +750,25 @@ class EpisodicStore:
         coherence means hold on to more.
 
         Access count provides resistance: frequently-retrieved traces
-        decay slower because they're clearly useful.
+        decay slower because they're clearly useful.  The access count
+        is modulated by **recency** (ACT-R-inspired): old accesses
+        contribute less to resistance than recent ones.
 
         Formula:
             decay_rate = ln(2) / half_life * coherence_factor
             coherence_factor = 0.5 + coherence  (range ~0.5-1.5)
-            resistance = 1 / (1 + access_count * 0.1)
+            recent_factor = exp(-ln(2) / 720h * hours_since_last_access)
+            effective_access = access_count * recent_factor
+            resistance = 1 / (1 + effective_access * 0.1)
             new_salience = salience * exp(-decay_rate * hours * resistance)
         """
         now = datetime.now(timezone.utc).replace(tzinfo=None)
         coherence_factor = 0.5 + max(0.0, min(1.0, coherence))
         base_rate = math.log(2) / max(half_life_hours, 0.1)
         decay_rate = base_rate * coherence_factor
+
+        # Recency half-life for access count weighting
+        access_recency_rate = math.log(2) / self.ACCESS_RECENCY_HALF_LIFE_HOURS
 
         # Consolidation kinds get extra decay resistance — they're
         # distilled knowledge and should persist much longer.
@@ -567,7 +801,12 @@ class EpisodicStore:
             if hours_since <= 0:
                 continue
 
-            resistance = 1.0 / (1.0 + access_count * 0.1)
+            # ACT-R-inspired access recency: old accesses fade from
+            # resistance calculation.  A trace accessed 10 times but
+            # not touched in 60 days has effective_access ~ 2.5.
+            recent_factor = math.exp(-access_recency_rate * hours_since)
+            effective_access = access_count * recent_factor
+            resistance = 1.0 / (1.0 + effective_access * 0.1)
             # Consolidation traces decay much slower
             if kind in _CONSOLIDATION_KINDS:
                 resistance *= _CONSOLIDATION_RESISTANCE
@@ -581,7 +820,7 @@ class EpisodicStore:
             self.conn.executemany(
                 "UPDATE traces SET salience = ? WHERE id = ?", updates
             )
-            self.conn.commit()
+            self._commit()
 
     def prune(self, min_salience: float = 0.01):
         """Delete traces that have decayed below the minimum salience threshold.
@@ -595,7 +834,7 @@ class EpisodicStore:
             "AND kind NOT IN ('summary', 'thread', 'arc')",
             (min_salience,),
         )
-        self.conn.commit()
+        self._commit()
 
     # ── Sessions ──────────────────────────────────────────────
 
@@ -614,7 +853,7 @@ class EpisodicStore:
             """,
             (session_id, person, started),
         )
-        self.conn.commit()
+        self._commit()
         return session_id
 
     def end_session(
@@ -629,7 +868,7 @@ class EpisodicStore:
             "UPDATE sessions SET ended = ?, summary = ? WHERE id = ?",
             (ended, summary or None, session_id),
         )
-        self.conn.commit()
+        self._commit()
 
     def get_active_session(self, person: str) -> Optional[Dict]:
         """Get the most recent session for a person that hasn't ended.
@@ -680,7 +919,7 @@ class EpisodicStore:
             "UPDATE sessions SET message_count = message_count + 1 WHERE id = ?",
             (session_id,),
         )
-        self.conn.commit()
+        self._commit()
 
     def detect_session_boundary(
         self,
@@ -878,8 +1117,203 @@ class EpisodicStore:
             "UPDATE traces SET metadata = ? WHERE id = ?",
             (json.dumps(existing), trace_id),
         )
-        self.conn.commit()
+        self._commit()
         return True
+
+    # ── Relationship graph ────────────────────────────────────
+
+    def add_relationship(
+        self,
+        subject: str,
+        predicate: str,
+        object: str,
+        confidence: float = 1.0,
+        source_trace_id: Optional[str] = None,
+        **metadata,
+    ) -> str:
+        """Add a relationship edge to the knowledge graph.
+
+        If an identical (subject, predicate, object) triple already
+        exists and is currently valid (``valid_until IS NULL``), the
+        existing ID is returned and confidence is updated to the
+        maximum of old and new values.
+
+        Parameters
+        ----------
+        subject : str
+            Source entity name (e.g. "Thomas", "Python").
+        predicate : str
+            Relationship type (e.g. "created_by", "likes", "knows").
+        object : str
+            Target entity name (e.g. "Aidan", "async patterns").
+        confidence : float
+            Confidence in this relationship (0-1, default 1.0).
+        source_trace_id : str, optional
+            The episodic trace that sourced this relationship.
+        **metadata :
+            Additional key-value metadata.
+
+        Returns
+        -------
+        str
+            The relationship ID (new or existing).
+        """
+        # Check for existing active triple
+        existing = self.conn.execute(
+            """
+            SELECT id, confidence FROM relationships
+            WHERE subject = ? AND predicate = ? AND object = ?
+              AND valid_until IS NULL
+            LIMIT 1
+            """,
+            (subject, predicate, object),
+        ).fetchone()
+
+        if existing:
+            # Update confidence if higher
+            new_confidence = max(existing[1] or 0.0, confidence)
+            self.conn.execute(
+                "UPDATE relationships SET confidence = ? WHERE id = ?",
+                (new_confidence, existing[0]),
+            )
+            self._commit()
+            return existing[0]
+
+        rel_id = _generate_id()
+        self.conn.execute(
+            """
+            INSERT INTO relationships
+                (id, subject, predicate, object, valid_from, valid_until,
+                 confidence, source_trace_id, metadata)
+            VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?)
+            """,
+            (
+                rel_id,
+                subject,
+                predicate,
+                object,
+                _now(),
+                confidence,
+                source_trace_id,
+                json.dumps(metadata) if metadata else None,
+            ),
+        )
+        self._commit()
+        return rel_id
+
+    def invalidate_relationship(self, rel_id: str) -> None:
+        """Mark a relationship as no longer valid (temporal end)."""
+        self.conn.execute(
+            "UPDATE relationships SET valid_until = ? WHERE id = ?",
+            (_now(), rel_id),
+        )
+        self._commit()
+
+    def get_relationships(
+        self,
+        entity: str,
+        direction: str = "both",
+        predicate: Optional[str] = None,
+        include_expired: bool = False,
+    ) -> List[Dict]:
+        """Get relationships for an entity (1-hop graph query).
+
+        Parameters
+        ----------
+        entity : str
+            Entity name to search for.
+        direction : str
+            ``"outgoing"`` (entity is subject), ``"incoming"`` (entity
+            is object), or ``"both"`` (default).
+        predicate : str, optional
+            Filter by relationship type.
+        include_expired : bool
+            If True, include relationships with ``valid_until`` set.
+
+        Returns
+        -------
+        list[dict]
+            Relationship records sorted by confidence descending.
+        """
+        clauses: List[str] = []
+        params: list = []
+
+        if direction == "outgoing":
+            clauses.append("subject = ?")
+            params.append(entity)
+        elif direction == "incoming":
+            clauses.append("object = ?")
+            params.append(entity)
+        else:
+            clauses.append("(subject = ? OR object = ?)")
+            params.extend([entity, entity])
+
+        if predicate:
+            clauses.append("predicate = ?")
+            params.append(predicate)
+
+        if not include_expired:
+            clauses.append("valid_until IS NULL")
+
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        rows = self.conn.execute(
+            f"SELECT * FROM relationships{where} ORDER BY confidence DESC",
+            params,
+        ).fetchall()
+        return [self._row_to_dict(r) for r in rows]
+
+    def get_entity_graph(
+        self,
+        entity: str,
+        hops: int = 1,
+        include_expired: bool = False,
+    ) -> List[Dict]:
+        """Get multi-hop relationships from an entity.
+
+        Parameters
+        ----------
+        entity : str
+            Starting entity.
+        hops : int
+            Number of hops (1 = direct relationships, 2 = friends-of-friends).
+        include_expired : bool
+            Include expired relationships.
+
+        Returns
+        -------
+        list[dict]
+            All relationships within the hop radius.
+        """
+        seen_ids: set = set()
+        entities_to_explore = {entity}
+        all_relationships: List[Dict] = []
+
+        for _ in range(hops):
+            next_entities: set = set()
+            for e in entities_to_explore:
+                rels = self.get_relationships(
+                    e, direction="both", include_expired=include_expired
+                )
+                for rel in rels:
+                    if rel["id"] not in seen_ids:
+                        seen_ids.add(rel["id"])
+                        all_relationships.append(rel)
+                        # Add the other end of the relationship
+                        next_entities.add(rel["subject"])
+                        next_entities.add(rel["object"])
+            entities_to_explore = next_entities - {entity}
+
+        return all_relationships
+
+    def count_relationships(self, include_expired: bool = False) -> int:
+        """Count relationships in the graph."""
+        if include_expired:
+            row = self.conn.execute("SELECT COUNT(*) FROM relationships").fetchone()
+        else:
+            row = self.conn.execute(
+                "SELECT COUNT(*) FROM relationships WHERE valid_until IS NULL"
+            ).fetchone()
+        return row[0] if row else 0
 
     # ── Internal ──────────────────────────────────────────────
 

@@ -1,8 +1,18 @@
 """
 engram.search.unified — Unified search combining FTS5 + semantic.
 
-Merges keyword (SQLite FTS5) and vector (ChromaDB) search results,
-deduplicates, and returns a combined ranking.
+Merges keyword (SQLite FTS5) and vector (ChromaDB) search results
+using Reciprocal Rank Fusion (RRF), deduplicates, and returns a
+combined ranking.
+
+RRF replaces the previous 50/50 weighted-average approach.  It is
+rank-based (not score-based) so it avoids the normalization asymmetry
+between FTS5 local min-max and cosine global /2.0.  RRF is proven to
+improve hybrid search precision by 15-25% and is used by Elasticsearch,
+Weaviate, and Vespa in production.
+
+Reference: Cormack, Clarke & Buettcher (2009) — "Reciprocal Rank Fusion
+outperforms Condorcet and individual rank learning methods."
 """
 
 from __future__ import annotations
@@ -10,24 +20,50 @@ from __future__ import annotations
 from typing import Dict, List, Optional
 
 from engram.search.indexed import IndexedSearch
+from engram.search.reranker import Reranker
 from engram.search.semantic import SemanticSearch
 
 
 class UnifiedSearch:
     """Combined keyword + semantic search across all memory types.
 
+    Pipeline: FTS5 + Semantic → RRF merge → Cross-encoder rerank
+
     If only ``indexed`` is provided, semantic search is skipped.
     This lets the system work without embeddings while still
     benefiting from them when available.
+
+    Uses Reciprocal Rank Fusion (RRF) to merge results from both
+    sources, then optionally rescores the top candidates with a
+    cross-encoder for higher-precision relevance ranking.
     """
+
+    # Default cosine distance cutoff.  Cosine distance ranges from
+    # 0 (identical) to 2 (opposite).  Results beyond this threshold
+    # are too dissimilar to be useful and are discarded before merge.
+    DEFAULT_SIMILARITY_THRESHOLD: float = 1.5
+
+    # RRF smoothing constant.  Higher values reduce the advantage of
+    # top-ranked results; 60 is the standard from the original paper.
+    DEFAULT_RRF_K: int = 60
 
     def __init__(
         self,
         indexed: IndexedSearch,
         semantic: Optional[SemanticSearch] = None,
+        similarity_threshold: Optional[float] = None,
+        rrf_k: Optional[int] = None,
+        reranker: Optional[Reranker] = None,
     ) -> None:
         self.indexed = indexed
         self.semantic = semantic
+        self.similarity_threshold = (
+            similarity_threshold
+            if similarity_threshold is not None
+            else self.DEFAULT_SIMILARITY_THRESHOLD
+        )
+        self.rrf_k = rrf_k if rrf_k is not None else self.DEFAULT_RRF_K
+        self.reranker = reranker
 
     def search(
         self,
@@ -52,8 +88,8 @@ class UnifiedSearch:
         Returns
         -------
         list[dict]
-            Merged results, each with a ``"combined_score"`` key.
-            Lower score = better match.
+            Merged results, each with a ``"combined_score"`` key
+            (higher = better match, via Reciprocal Rank Fusion).
         """
         if not query or not query.strip():
             return []
@@ -82,15 +118,33 @@ class UnifiedSearch:
                     n_results=limit,
                     where=where,
                 )
+                # FR-3: Filter out results above the similarity threshold.
+                # Cosine distance [0, 2]: 0 = identical, 2 = opposite.
+                sem_results = [
+                    r
+                    for r in sem_results
+                    if r.get("distance", 2.0) <= self.similarity_threshold
+                ]
             except Exception:
                 # Semantic search is best-effort; don't fail the whole query
                 sem_results = []
 
-        # -- Merge and deduplicate -----------------------------------------
-        merged = self._merge(fts_results, sem_results)
+        # -- Merge via Reciprocal Rank Fusion ------------------------------
+        merged = self._merge_rrf(fts_results, sem_results, k=self.rrf_k)
 
-        # -- Sort by combined score ----------------------------------------
-        merged.sort(key=lambda r: r.get("combined_score", 999.0))
+        # -- Sort by combined score (higher = better for RRF) --------------
+        merged.sort(key=lambda r: r.get("combined_score", 0.0), reverse=True)
+
+        # -- Cross-encoder reranking (optional) ----------------------------
+        # Rerank the top candidates for higher-precision relevance.
+        # The cross-encoder sees (query, document) jointly, which is
+        # much more accurate than bi-encoder similarity or RRF alone.
+        if self.reranker is not None:
+            merged = self.reranker.rerank(
+                query=query,
+                results=merged,
+                top_n=limit,
+            )
 
         return merged[:limit]
 
@@ -111,87 +165,112 @@ class UnifiedSearch:
         return None
 
     @staticmethod
-    def _merge(
+    def _merge_rrf(
         fts_results: List[Dict],
         sem_results: List[Dict],
+        k: int = 60,
     ) -> List[Dict]:
-        """Merge FTS and semantic results, deduplicate, compute combined score.
+        """Merge FTS and semantic results using Reciprocal Rank Fusion.
+
+        RRF score for each document = sum over sources of:
+            1 / (k + rank_in_source)
+
+        where rank is 1-based (best result = rank 1).
+
+        Documents appearing in both sources get contributions from
+        both, naturally boosting items that both retrieval methods
+        agree on.  Documents in only one source still participate
+        with their single-source RRF score.
 
         Deduplication key priority:
         1. ``id`` field (messages/traces have a 12-char hex ID)
         2. ``doc_id`` field (semantic results)
         3. Content hash as fallback
 
-        Scoring:
-        - FTS rank is negative (more negative = better).  We normalise
-          to 0..1 range within the result set.
-        - Semantic distance is 0..2 (cosine).  We normalise to 0..1.
-        - Combined score = weighted average: 0.5 * fts_norm + 0.5 * sem_norm.
-        - Items appearing in only one source get 0.5 for the missing score.
+        Parameters
+        ----------
+        k : int
+            RRF smoothing constant (default 60, per Cormack et al.).
+            Higher values reduce the advantage of top-ranked results.
+
+        Returns
+        -------
+        list[dict]
+            Merged results with ``combined_score`` (higher = better).
         """
         seen: Dict[str, Dict] = {}
 
-        # -- Process FTS results -------------------------------------------
-        # Normalise FTS ranks to 0..1 (lower = better)
-        fts_ranks = [abs(r.get("rank", 0)) for r in fts_results]
-        fts_max = max(fts_ranks) if fts_ranks else 1.0
-        fts_max = fts_max if fts_max > 0 else 1.0
-
-        for i, result in enumerate(fts_results):
+        # -- Process FTS results (already sorted by rank, best first) ------
+        for rank_0, result in enumerate(fts_results):
+            rank = rank_0 + 1  # 1-based
             key = _dedup_key(result)
-            normalised_rank = abs(result.get("rank", 0)) / fts_max
-            # Invert so that best match → lowest score
-            fts_score = 1.0 - normalised_rank if fts_max > 0 else 0.5
+            rrf_score = 1.0 / (k + rank)
 
             if key in seen:
-                seen[key]["fts_score"] = fts_score
+                seen[key]["combined_score"] += rrf_score
+                seen[key]["fts_rank"] = rank
             else:
                 entry = dict(result)
-                entry["fts_score"] = fts_score
-                entry["sem_score"] = 0.5  # default if not in semantic
+                entry["combined_score"] = rrf_score
+                entry["fts_rank"] = rank
+                entry["sem_rank"] = None
                 seen[key] = entry
 
-        # -- Process semantic results --------------------------------------
-        sem_distances = [r.get("distance", 1.0) for r in sem_results]
-        sem_max = max(sem_distances) if sem_distances else 1.0
-        sem_max = sem_max if sem_max > 0 else 1.0
-
-        for result in sem_results:
+        # -- Process semantic results (already sorted by distance, best first)
+        for rank_0, result in enumerate(sem_results):
+            rank = rank_0 + 1  # 1-based
             key = _dedup_key(result)
-            sem_score = result.get("distance", 1.0) / sem_max
+            rrf_score = 1.0 / (k + rank)
 
             if key in seen:
-                seen[key]["sem_score"] = sem_score
+                seen[key]["combined_score"] += rrf_score
+                seen[key]["sem_rank"] = rank
                 # Enrich with semantic metadata if missing
                 if "collection" not in seen[key]:
                     seen[key]["collection"] = result.get("collection", "")
             else:
                 entry = dict(result)
-                entry["sem_score"] = sem_score
-                entry["fts_score"] = 0.5  # default if not in FTS
+                entry["combined_score"] = rrf_score
+                entry["sem_rank"] = rank
+                entry["fts_rank"] = None
                 # Normalise field names to match FTS format
                 if "content" not in entry and "doc_id" in entry:
                     entry["content"] = result.get("content", "")
                 seen[key] = entry
 
-        # -- Compute combined scores ---------------------------------------
-        for entry in seen.values():
-            fts_s = entry.get("fts_score", 0.5)
-            sem_s = entry.get("sem_score", 0.5)
-            entry["combined_score"] = 0.5 * fts_s + 0.5 * sem_s
-
         return list(seen.values())
 
 
+def _normalize_trace_id(raw_id: str) -> str:
+    """Strip known prefixes to get the canonical trace ID.
+
+    ChromaDB stores doc IDs as ``"trace_<id>"``, ``"skill_<hash>"``,
+    ``"rel_<hash>"``, ``"soul_p<n>_<hash>"``, etc.  FTS results use
+    the bare 12-char hex ID.  This normalises both to the same form
+    so deduplication actually works (FR-4).
+    """
+    if raw_id.startswith("trace_"):
+        return raw_id[6:]  # strip "trace_" prefix
+    return raw_id
+
+
 def _dedup_key(result: Dict) -> str:
-    """Compute a deduplication key for a search result."""
-    # Prefer explicit ID fields
-    if result.get("id"):
-        return f"id:{result['id']}"
-    if result.get("doc_id"):
-        return f"doc:{result['doc_id']}"
-    if result.get("trace_id"):
-        return f"trace:{result['trace_id']}"
+    """Compute a deduplication key for a search result.
+
+    Normalises ID formats so FTS results (``id="abc123def"``) and
+    semantic results (``doc_id="trace_abc123def"``) match correctly.
+    """
+    # Extract the raw ID from whichever field is present
+    raw_id = result.get("id") or result.get("trace_id") or result.get("doc_id") or ""
+
+    if raw_id:
+        return f"id:{_normalize_trace_id(raw_id)}"
+
+    # Also check metadata — ChromaDB results carry trace_id in metadata
+    meta = result.get("metadata", {})
+    if isinstance(meta, dict) and meta.get("trace_id"):
+        return f"id:{_normalize_trace_id(meta['trace_id'])}"
+
     # Fall back to content hash
     content = result.get("content", "")
     return f"hash:{hash(content)}"

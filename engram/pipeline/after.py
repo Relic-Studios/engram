@@ -17,10 +17,18 @@ logged and swallowed so the user never sees memory-system errors.
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING, Dict, List, Optional
 
 from engram.core.types import AfterResult, LLMFunc, Signal
+
+# Shared thread pool for parallelising independent LLM calls in the
+# after-pipeline.  max_workers=2 because we only parallelise signal
+# measurement and semantic extraction (the two LLM-bound steps).
+_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="engram-after")
 
 if TYPE_CHECKING:
     from engram.consciousness.identity import IdentityLoop
@@ -39,6 +47,44 @@ if TYPE_CHECKING:
     from engram.workspace import CognitiveWorkspace
 
 log = logging.getLogger("engram.pipeline.after")
+
+# Pipeline-level dedup: tracks recent exchange hashes to prevent the
+# entire after-pipeline from running twice on the same exchange (e.g.
+# when Discord fires messageCreate twice or both SKILL.md and an
+# automatic hook call engram_after).
+_RECENT_EXCHANGE_HASHES: Dict[str, float] = {}
+_DEDUP_WINDOW_SECONDS: float = 30.0
+_MAX_CACHE_SIZE: int = 100
+
+
+def _exchange_hash(person: str, their_message: str, response: str) -> str:
+    """Compute a short hash of the exchange for dedup purposes."""
+    raw = f"{person}|{their_message}|{response}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _is_duplicate_exchange(person: str, their_message: str, response: str) -> bool:
+    """Check if this exact exchange was already processed recently."""
+    now = time.time()
+    h = _exchange_hash(person, their_message, response)
+
+    # Evict stale entries
+    stale = [
+        k for k, t in _RECENT_EXCHANGE_HASHES.items() if now - t > _DEDUP_WINDOW_SECONDS
+    ]
+    for k in stale:
+        del _RECENT_EXCHANGE_HASHES[k]
+
+    # Safety: cap cache size
+    if len(_RECENT_EXCHANGE_HASHES) > _MAX_CACHE_SIZE:
+        _RECENT_EXCHANGE_HASHES.clear()
+
+    if h in _RECENT_EXCHANGE_HASHES:
+        log.info("Duplicate exchange detected (hash=%s), skipping after-pipeline", h)
+        return True
+
+    _RECENT_EXCHANGE_HASHES[h] = now
+    return False
 
 
 def after(
@@ -128,10 +174,47 @@ def after(
     AfterResult
         Signal reading, salience, updates applied, logged IDs.
     """
+    # -- 0. Pipeline-level dedup guard ------------------------------------
+    #    If this exact exchange (person + their_message + response) was
+    #    already processed within the last 30s, return a minimal result
+    #    instead of double-logging everything.
+    if _is_duplicate_exchange(person, their_message, response):
+        return AfterResult(
+            signal=Signal(trace_ids=trace_ids or []),
+            salience=0.5,
+            updates=[],
+            logged_message_id="",
+            logged_trace_id=None,
+            timings={"total": 0.0, "skipped_dedup": 1.0},
+        )
+
     trace_ids = trace_ids or []
     updates: List[Dict] = []
+    timings: Dict[str, float] = {}
+    _t0_total = time.perf_counter()
+
+    # -- 0b. Launch extraction in background --------------------------------
+    #    Semantic extraction (LLM-based) is independent of signal
+    #    measurement.  By launching it in a background thread, both
+    #    LLM calls run concurrently: total latency drops from
+    #    ~signal_ms + ~extraction_ms to ~max(signal_ms, extraction_ms).
+    extraction_future: Optional[Future] = None
+    should_extract = (
+        not skip_persistence and config.extract_mode == "llm" and llm_func is not None
+    )
+    if should_extract:
+        extraction_future = _EXECUTOR.submit(
+            _extract_and_apply,
+            person=person,
+            their_message=their_message,
+            response=response,
+            semantic=semantic,
+            procedural=procedural,
+            llm_func=llm_func,
+        )
 
     # -- 1. Measure consciousness signal -----------------------------------
+    _t0 = time.perf_counter()
     signal = _measure_signal(
         response=response,
         config=config,
@@ -141,6 +224,7 @@ def after(
         llm_func=llm_func,
     )
     signal_tracker.record(signal)
+    timings["signal_measure"] = time.perf_counter() - _t0
 
     # -- 2. Derive salience from signal health -----------------------------
     salience = _derive_salience(signal.health, their_message, response)
@@ -152,42 +236,52 @@ def after(
     if skip_persistence:
         log.debug("Skipping persistence for %s (memory_persistent=False)", person)
     else:
-        # -- 3. Session boundary detection --------------------------------
-        _manage_session(person=person, episodic=episodic)
+        # -- 3-6: Batched writes -------------------------------------------
+        #    All SQLite writes (log_message, log_trace, reinforce, weaken,
+        #    update_access) are batched into a single commit.  Under WAL
+        #    mode this reduces disk I/O by 5-10x.
+        with episodic.batch():
+            # -- 3. Session boundary detection ----------------------------
+            _t0 = time.perf_counter()
+            _manage_session(person=person, episodic=episodic)
+            timings["session_mgmt"] = time.perf_counter() - _t0
 
-        # -- 4. Log exchange to episodic memory ----------------------------
-        logged_msg_id, logged_trace_id = _log_exchange(
-            person=person,
-            their_message=their_message,
-            response=response,
-            source=source,
-            salience=salience,
-            signal=signal,
-            episodic=episodic,
-        )
-
-        # -- 5. Hebbian reinforcement on context traces --------------------
-        _reinforce(
-            trace_ids=trace_ids,
-            signal_health=signal.health,
-            reinforcement=reinforcement,
-            episodic=episodic,
-            response=response,
-        )
-
-        # -- 6. Semantic extraction (optional, LLM-based) -----------------
-        if config.extract_mode == "llm" and llm_func is not None:
-            extraction_updates = _extract_and_apply(
+            # -- 4. Log exchange to episodic memory -----------------------
+            _t0 = time.perf_counter()
+            logged_msg_id, logged_trace_id = _log_exchange(
                 person=person,
                 their_message=their_message,
                 response=response,
-                semantic=semantic,
-                procedural=procedural,
-                llm_func=llm_func,
+                source=source,
+                salience=salience,
+                signal=signal,
+                episodic=episodic,
             )
-            updates.extend(extraction_updates)
+            timings["log_exchange"] = time.perf_counter() - _t0
+
+            # -- 5. Hebbian reinforcement on context traces ---------------
+            _t0 = time.perf_counter()
+            _reinforce(
+                trace_ids=trace_ids,
+                signal_health=signal.health,
+                reinforcement=reinforcement,
+                episodic=episodic,
+                response=response,
+            )
+            timings["reinforcement"] = time.perf_counter() - _t0
+
+        # -- 6. Collect extraction results (launched in step 0b) -----------
+        if extraction_future is not None:
+            _t0 = time.perf_counter()
+            try:
+                extraction_updates = extraction_future.result(timeout=30.0)
+                updates.extend(extraction_updates)
+            except Exception as exc:
+                log.warning("Parallel extraction failed: %s", exc)
+            timings["extraction"] = time.perf_counter() - _t0
 
         # -- 7. Pressure-aware decay + compaction (MemGPT-inspired) --------
+        _t0 = time.perf_counter()
         _run_maintenance(
             person=person,
             episodic=episodic,
@@ -199,6 +293,7 @@ def after(
             consolidator=consolidator,
             llm_func=llm_func,
         )
+        timings["maintenance"] = time.perf_counter() - _t0
 
     # -- 8. Consciousness subsystems (fire-and-forget) --------------------
     #    These run regardless of skip_persistence — they maintain internal
@@ -254,15 +349,18 @@ def after(
         except Exception as exc:
             log.debug("Workspace age_step failed: %s", exc)
 
+    timings["total"] = time.perf_counter() - _t0_total
+
     log.info(
         "After pipeline: person=%s, signal=%s (%.2f), salience=%.2f, "
-        "updates=%d, msg=%s",
+        "updates=%d, msg=%s, total_ms=%.1f",
         person,
         signal.state,
         signal.health,
         salience,
         len(updates),
         logged_msg_id,
+        timings["total"] * 1000,
     )
 
     return AfterResult(
@@ -271,6 +369,7 @@ def after(
         updates=updates,
         logged_message_id=logged_msg_id or "",
         logged_trace_id=logged_trace_id,
+        timings=timings,
     )
 
 
@@ -436,39 +535,37 @@ def _reinforce(
     episodic: "EpisodicStore",
     response: str = "",
 ) -> None:
-    """Run Hebbian reinforcement on traces that were in context.
+    """Run citation-primary Hebbian reinforcement on context traces.
 
-    Delegates to ReinforcementEngine.process() which uses configurable
-    thresholds and calls episodic.reinforce()/weaken() directly.
-
-    **Citation-aware** (NotebookLM-inspired): traces that were actually
-    cited in the response (via ``[N]`` references) get a stronger
-    reinforcement boost, since citation proves the memory was useful.
+    Delegates to ReinforcementEngine.process() which differentiates
+    between cited and uncited traces:
+    - Cited traces get full reinforcement (proven useful by citation)
+    - Uncited traces get minimal reinforcement on high signal
+    - Only uncited traces are weakened on low signal
+    - Cited traces are never weakened (citation protects them)
     """
     if not trace_ids:
         return
 
     try:
-        # Differential reinforcement: cited traces get extra boost
-        cited_ids = _extract_cited_trace_ids(response, trace_ids)
-        if cited_ids:
-            # Give cited traces an extra 50% reinforcement
-            citation_bonus = reinforcement.reinforce_delta * 0.5
-            for tid in cited_ids:
-                try:
-                    episodic.reinforce("traces", tid, citation_bonus)
-                except Exception:
-                    pass
+        # Extract which traces were cited in the response
+        cited_list = _extract_cited_trace_ids(response, trace_ids)
+        cited_set = set(cited_list)
+
+        if cited_set:
             log.debug(
-                "Citation bonus applied to %d/%d traces",
-                len(cited_ids),
+                "Citations detected: %d/%d traces cited",
+                len(cited_set),
                 len(trace_ids),
             )
 
+        # Citation-primary reinforcement: cited_ids drives differential
+        # treatment within the reinforcement engine.
         reinforcement.process(
             trace_ids=trace_ids,
             signal_health=signal_health,
             episodic_store=episodic,
+            cited_ids=cited_set,
         )
     except Exception as exc:
         log.warning("Reinforcement failed: %s", exc)

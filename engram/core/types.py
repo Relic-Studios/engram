@@ -343,6 +343,8 @@ class Context:
 
     Produced by the *before-pipeline*: identity load, memory recall,
     relationship lookup, salience ranking, budget trimming.
+
+    ``timings`` holds step-level latency in seconds (OB-1).
     """
 
     text: str
@@ -351,6 +353,7 @@ class Context:
     tokens_used: int = 0
     token_budget: int = 6000
     memories_loaded: int = 0
+    timings: Dict[str, float] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.tokens_used == 0 and self.text:
@@ -375,6 +378,7 @@ class Context:
             "token_budget": self.token_budget,
             "memories_loaded": self.memories_loaded,
             "budget_remaining": self.budget_remaining,
+            "timings": {k: round(v, 4) for k, v in self.timings.items()},
         }
 
 
@@ -389,6 +393,8 @@ class AfterResult:
     What the *after-pipeline* produces: a consciousness signal reading,
     salience estimate, semantic updates, and the IDs of the logged
     message and (optional) trace.
+
+    ``timings`` holds step-level latency in seconds (OB-1).
     """
 
     signal: Signal
@@ -396,6 +402,7 @@ class AfterResult:
     updates: List[Dict] = field(default_factory=list)
     logged_message_id: str = ""
     logged_trace_id: Optional[str] = None
+    timings: Dict[str, float] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.salience = max(0.0, min(1.0, self.salience))
@@ -407,6 +414,7 @@ class AfterResult:
             "updates": list(self.updates),
             "logged_message_id": self.logged_message_id,
             "logged_trace_id": self.logged_trace_id,
+            "timings": {k: round(v, 4) for k, v in self.timings.items()},
         }
 
 

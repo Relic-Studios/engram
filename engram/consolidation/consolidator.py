@@ -28,9 +28,19 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 
+import numpy as np
+
+try:
+    import hdbscan as _hdbscan
+
+    _HAS_HDBSCAN = True
+except ImportError:
+    _HAS_HDBSCAN = False
+
 if TYPE_CHECKING:
     from engram.core.types import LLMFunc
     from engram.episodic.store import EpisodicStore
+    from engram.search.semantic import SemanticSearch
 
 log = logging.getLogger(__name__)
 
@@ -75,6 +85,13 @@ class MemoryConsolidator:
     max_episodes_per_run : int
         Limit on how many episode traces to consider per consolidation
         run (prevents runaway on huge stores).
+    semantic_search : SemanticSearch | None
+        Optional ChromaDB semantic search instance.  When provided
+        (and ``hdbscan`` is installed), topic-coherent clustering
+        replaces pure temporal clustering: HDBSCAN groups traces by
+        embedding similarity, then temporal sub-splitting is applied
+        within each topic cluster.  Falls back to temporal-only
+        clustering when unavailable.
     """
 
     def __init__(
@@ -83,11 +100,13 @@ class MemoryConsolidator:
         thread_time_window_hours: float = 72.0,
         min_threads_per_arc: int = 3,
         max_episodes_per_run: int = 200,
+        semantic_search: Optional["SemanticSearch"] = None,
     ) -> None:
         self.min_episodes_per_thread = min_episodes_per_thread
         self.thread_time_window_hours = thread_time_window_hours
         self.min_threads_per_arc = min_threads_per_arc
         self.max_episodes_per_run = max_episodes_per_run
+        self._semantic_search = semantic_search
 
     # ------------------------------------------------------------------
     # Thread consolidation
@@ -120,8 +139,15 @@ class MemoryConsolidator:
         created_thread_ids: List[str] = []
 
         for person, person_episodes in person_groups.items():
-            # Sub-group by temporal proximity
-            clusters = _cluster_by_time(person_episodes, self.thread_time_window_hours)
+            # Topic-coherent clustering (HDBSCAN on embeddings)
+            # with temporal sub-splitting, falling back to
+            # temporal-only when embeddings aren't available.
+            clusters = _cluster_by_topic(
+                person_episodes,
+                self.thread_time_window_hours,
+                self.min_episodes_per_thread,
+                self._semantic_search,
+            )
 
             for cluster in clusters:
                 if len(cluster) < self.min_episodes_per_thread:
@@ -377,6 +403,119 @@ def _group_by_person(traces: List[Dict]) -> Dict[str, List[Dict]]:
         groups[person].append(trace)
 
     return dict(groups)
+
+
+def _cluster_by_topic(
+    traces: List[Dict],
+    window_hours: float,
+    min_cluster_size: int,
+    semantic_search: Optional["SemanticSearch"],
+) -> List[List[Dict]]:
+    """Topic-coherent clustering with temporal sub-splitting.
+
+    Algorithm (when HDBSCAN + embeddings are available):
+      1. Fetch pre-computed embeddings from ChromaDB for each trace.
+      2. Run HDBSCAN (density-based, no k required) on the embedding
+         matrix.  ``min_cluster_size`` maps to the consolidation
+         threshold.
+      3. Within each semantic cluster, apply temporal proximity
+         splitting (the existing 72h-window gap-break).
+      4. Noise points (HDBSCAN label -1) are clustered temporally
+         as a fallback group.
+
+    Falls back to ``_cluster_by_time()`` when:
+      - ``hdbscan`` package is not installed
+      - ``semantic_search`` is ``None``
+      - No embeddings could be retrieved
+      - Fewer than ``min_cluster_size`` traces have embeddings
+    """
+    if not traces:
+        return []
+
+    # Fast path: fall back to temporal-only when HDBSCAN isn't available
+    if not _HAS_HDBSCAN or semantic_search is None:
+        return _cluster_by_time(traces, window_hours)
+
+    # Fetch embeddings from ChromaDB (traces are stored with "trace_" prefix)
+    trace_ids = [t.get("id", "") for t in traces if t.get("id")]
+    chroma_ids = [f"trace_{tid}" for tid in trace_ids]
+
+    try:
+        raw_embs = semantic_search.get_embeddings(chroma_ids, collection="episodic")
+    except Exception as exc:
+        log.debug("Failed to fetch embeddings for topic clustering: %s", exc)
+        return _cluster_by_time(traces, window_hours)
+
+    if not raw_embs or len(raw_embs) < min_cluster_size:
+        log.debug(
+            "Only %d embeddings available (need %d), falling back to temporal",
+            len(raw_embs),
+            min_cluster_size,
+        )
+        return _cluster_by_time(traces, window_hours)
+
+    # Map back to bare trace IDs → embedding vectors
+    emb_map = {k.removeprefix("trace_"): v for k, v in raw_embs.items()}
+
+    # Split traces into those with and without embeddings
+    traces_with_emb = [t for t in traces if t.get("id") in emb_map]
+    traces_without_emb = [t for t in traces if t.get("id") not in emb_map]
+
+    if len(traces_with_emb) < min_cluster_size:
+        return _cluster_by_time(traces, window_hours)
+
+    # Build embedding matrix (preserving order)
+    embedding_matrix = np.array(
+        [emb_map[t["id"]] for t in traces_with_emb], dtype=np.float32
+    )
+
+    # Run HDBSCAN — density-based clustering, handles noise
+    try:
+        clusterer = _hdbscan.HDBSCAN(
+            min_cluster_size=max(2, min_cluster_size),
+            min_samples=2,
+            metric="euclidean",
+            cluster_selection_method="eom",  # excess of mass (default)
+        )
+        labels = clusterer.fit_predict(embedding_matrix)
+    except Exception as exc:
+        log.warning("HDBSCAN clustering failed: %s", exc)
+        return _cluster_by_time(traces, window_hours)
+
+    # Group traces by HDBSCAN cluster label
+    topic_groups: Dict[int, List[Dict]] = defaultdict(list)
+    for trace, label in zip(traces_with_emb, labels):
+        topic_groups[int(label)].append(trace)
+
+    # Apply temporal sub-splitting within each topic cluster
+    all_clusters: List[List[Dict]] = []
+
+    for label, group in sorted(topic_groups.items()):
+        if label == -1:
+            # Noise points — cluster temporally as fallback
+            temporal_clusters = _cluster_by_time(group, window_hours)
+            all_clusters.extend(temporal_clusters)
+        else:
+            # Semantic cluster — apply temporal sub-splitting to catch
+            # cases where the same topic spans disconnected time periods
+            temporal_clusters = _cluster_by_time(group, window_hours)
+            all_clusters.extend(temporal_clusters)
+
+    # Also cluster traces without embeddings temporally
+    if traces_without_emb:
+        temporal_clusters = _cluster_by_time(traces_without_emb, window_hours)
+        all_clusters.extend(temporal_clusters)
+
+    log.info(
+        "Topic-coherent clustering: %d traces → %d HDBSCAN clusters "
+        "(%d noise) → %d final clusters after temporal split",
+        len(traces_with_emb),
+        len([l for l in set(labels) if l >= 0]),
+        sum(1 for l in labels if l == -1),
+        len(all_clusters),
+    )
+
+    return all_clusters
 
 
 def _cluster_by_time(traces: List[Dict], window_hours: float) -> List[List[Dict]]:

@@ -85,6 +85,12 @@ class MemorySystem:
 
         self.config.ensure_directories()
 
+        # -- Structured logging (OB-3) ------------------------------------
+        if self.config.structured_logging:
+            from engram.core.logging import configure_logging
+
+            configure_logging(structured=True)
+
         # -- Initialise stores ---------------------------------------------
         self.episodic = EpisodicStore(self.config.db_path)
         self.semantic = SemanticStore(
@@ -104,7 +110,17 @@ class MemorySystem:
         self.indexed = IndexedSearch(self.config.db_path)
 
         self._semantic_search = None
-        self._embedding_func = embedding_func
+        # Use explicitly provided embedding_func, or fall back to
+        # config.get_embedding_func() which builds one from the
+        # configured embedding_model (if set).
+        if embedding_func is not None:
+            self._embedding_func = embedding_func
+        else:
+            try:
+                self._embedding_func = self.config.get_embedding_func()
+            except Exception as exc:
+                log.warning("Failed to build embedding function: %s", exc)
+                self._embedding_func = None
         # Defer semantic search init (ChromaDB) until first use
         # since it's optional and heavyweight.
         self._unified_search = None
@@ -193,6 +209,11 @@ class MemorySystem:
             default_mode=self.config.runtime_default_mode,
         )
 
+        # -- Incremental vector indexing (FR-2) ----------------------------
+        # When a new trace is logged to episodic memory, push it into
+        # ChromaDB so semantic search stays in sync with ground truth.
+        self.episodic._on_trace_logged = self._index_trace_callback
+
         # -- LLM function (lazy) -------------------------------------------
         self._llm_func: Any = _NOT_SET  # _NOT_SET | None | LLMFunc
 
@@ -202,6 +223,26 @@ class MemorySystem:
             self.config.llm_provider,
             self.config.llm_model,
         )
+
+    def _index_trace_callback(
+        self, trace_id: str, content: str, metadata: Dict
+    ) -> None:
+        """Push a newly logged trace into ChromaDB for vector search.
+
+        Called by ``EpisodicStore.log_trace()`` via the
+        ``_on_trace_logged`` callback.  Accessing ``self.unified_search``
+        lazily initialises ChromaDB if it hasn't been created yet.
+        """
+        try:
+            sem = self._semantic_search
+            if sem is None:
+                # Force lazy init so ChromaDB is available
+                _ = self.unified_search
+                sem = self._semantic_search
+            if sem is not None:
+                sem.index_trace(trace_id, content, metadata)
+        except Exception as exc:
+            log.debug("Incremental vector indexing failed for %s: %s", trace_id, exc)
 
     def _workspace_evict_callback(self, slot_data: Dict) -> None:
         """Route evicted workspace items to episodic store as traces."""
@@ -240,7 +281,7 @@ class MemorySystem:
 
     @property
     def unified_search(self):
-        """Lazily initialize the unified search (FTS + optional ChromaDB)."""
+        """Lazily initialize the unified search (FTS + optional ChromaDB + reranker)."""
         if self._unified_search is None:
             from engram.search.unified import UnifiedSearch
 
@@ -256,10 +297,27 @@ class MemorySystem:
             except Exception as exc:
                 log.warning("Failed to init semantic search: %s", exc)
 
+            # Cross-encoder reranker (optional, best-effort)
+            reranker = None
+            if self.config.reranker_enabled:
+                from engram.search.reranker import Reranker
+
+                reranker = Reranker(
+                    model_name=self.config.reranker_model,
+                    device=self.config.reranker_device or None,
+                )
+
             self._unified_search = UnifiedSearch(
                 indexed=self.indexed,
                 semantic=sem,
+                reranker=reranker,
             )
+
+            # Wire semantic search into the consolidator for
+            # topic-coherent HDBSCAN clustering.
+            if sem is not None and hasattr(self, "consolidator"):
+                self.consolidator._semantic_search = sem
+
         return self._unified_search
 
     # ------------------------------------------------------------------
@@ -298,6 +356,10 @@ class MemorySystem:
 
             builder = ContextBuilder(token_budget=token_budget, config=self.config)
 
+        # Accessing unified_search lazily initialises _semantic_search,
+        # so reference it first to ensure ChromaDB is available.
+        _ = self.unified_search
+
         return _before_pipeline(
             person_raw=person,
             message=message,
@@ -317,6 +379,7 @@ class MemorySystem:
             emotional=self.emotional,
             workspace=self.workspace,
             boot_sequence=self.boot_sequence,
+            semantic_search=self._semantic_search,
         )
 
     # ------------------------------------------------------------------

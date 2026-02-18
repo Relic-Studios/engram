@@ -27,6 +27,7 @@ from engram.consolidation.compactor import (
 from engram.consolidation.consolidator import (
     MemoryConsolidator,
     _cluster_by_time,
+    _cluster_by_topic,
     _extractive_arc_summary,
     _extractive_thread_summary,
     _format_traces_for_llm,
@@ -738,6 +739,70 @@ class TestConsolidatorHelpers:
 
     def test_cluster_by_time_empty(self):
         assert _cluster_by_time([], 72.0) == []
+
+    # -- Topic-coherent clustering (HDBSCAN) --
+
+    def test_cluster_by_topic_fallback_no_search(self):
+        """Without semantic_search, falls back to temporal clustering."""
+        traces = [
+            {"id": "a", "created": "2025-01-01T10:00:00Z"},
+            {"id": "b", "created": "2025-01-01T11:00:00Z"},
+        ]
+        clusters = _cluster_by_topic(traces, 72.0, 2, semantic_search=None)
+        assert len(clusters) == 1
+        assert len(clusters[0]) == 2
+
+    def test_cluster_by_topic_empty(self):
+        assert _cluster_by_topic([], 72.0, 2, semantic_search=None) == []
+
+    def test_cluster_by_topic_with_embeddings(self):
+        """HDBSCAN should separate traces with distinct embeddings."""
+        import numpy as np
+
+        # Create traces: 3 about topic A, 3 about topic B, well separated
+        traces = []
+        for i in range(6):
+            traces.append(
+                {
+                    "id": f"t{i}",
+                    "created": f"2025-01-01T{10 + i}:00:00Z",
+                }
+            )
+
+        # Mock semantic_search that returns clearly separated embeddings
+        mock_search = MagicMock()
+        embeddings = {
+            "trace_t0": [1.0, 0.0, 0.0] * 10,  # Topic A (30-dim for HDBSCAN)
+            "trace_t1": [0.98, 0.02, 0.0] * 10,
+            "trace_t2": [0.97, 0.03, 0.0] * 10,
+            "trace_t3": [0.0, 0.0, 1.0] * 10,  # Topic B
+            "trace_t4": [0.0, 0.02, 0.98] * 10,
+            "trace_t5": [0.0, 0.03, 0.97] * 10,
+        }
+        mock_search.get_embeddings.return_value = embeddings
+
+        clusters = _cluster_by_topic(traces, 72.0, 2, semantic_search=mock_search)
+        # Should produce at least 2 clusters (topic A and topic B)
+        # HDBSCAN with 3 points per topic and min_cluster_size=2 should find them
+        assert len(clusters) >= 2
+        # All traces should be in some cluster
+        all_trace_ids = set()
+        for cluster in clusters:
+            for t in cluster:
+                all_trace_ids.add(t["id"])
+        assert all_trace_ids == {f"t{i}" for i in range(6)}
+
+    def test_cluster_by_topic_few_embeddings_fallback(self):
+        """Falls back to temporal if not enough embeddings."""
+        traces = [
+            {"id": "a", "created": "2025-01-01T10:00:00Z"},
+            {"id": "b", "created": "2025-01-01T11:00:00Z"},
+        ]
+        mock_search = MagicMock()
+        # Return only 1 embedding (below min_cluster_size=5)
+        mock_search.get_embeddings.return_value = {"trace_a": [1.0, 0.0]}
+        clusters = _cluster_by_topic(traces, 72.0, 5, semantic_search=mock_search)
+        assert len(clusters) == 1  # temporal fallback: single cluster
 
     def test_time_range(self):
         traces = [

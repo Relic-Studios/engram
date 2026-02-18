@@ -18,7 +18,8 @@ The caller injects ``context.text`` into the system prompt.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, List, Optional
+import time
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 from engram.core.types import Context
 from engram.trust import AccessPolicy, TrustGate
@@ -32,6 +33,7 @@ if TYPE_CHECKING:
     from engram.personality import PersonalitySystem
     from engram.procedural.store import ProceduralStore
     from engram.safety import InjuryTracker
+    from engram.search.semantic import SemanticSearch
     from engram.search.unified import UnifiedSearch
     from engram.semantic.identity import IdentityResolver
     from engram.semantic.store import SemanticStore
@@ -62,6 +64,7 @@ def before(
     emotional: Optional["EmotionalSystem"] = None,
     workspace: Optional["CognitiveWorkspace"] = None,
     boot_sequence: Optional["BootSequence"] = None,
+    semantic_search: Optional["SemanticSearch"] = None,
 ) -> Context:
     """Run the full before-pipeline and return an assembled Context.
 
@@ -119,8 +122,13 @@ def before(
         Assembled context with ``text``, ``trace_ids``, ``person``,
         token usage metadata.
     """
+    timings: Dict[str, float] = {}
+    _t0_total = time.perf_counter()
+
     # -- 1. Resolve identity -----------------------------------------------
+    _t0 = time.perf_counter()
     person = identity.resolve(person_raw)
+    timings["identity_resolve"] = time.perf_counter() - _t0
     log.debug("Resolved %r -> %r", person_raw, person)
 
     # -- 1b. Resolve trust policy ------------------------------------------
@@ -177,6 +185,7 @@ def before(
         # contains enough substance to search on.
         if search and len(message.split()) >= 3:
             try:
+                _t0 = time.perf_counter()
                 search_results = search.search(query=message, person=person, limit=10)
                 # Merge search results into salient_traces, deduplicating by id
                 existing_ids = {t.get("id") for t in salient_traces if t.get("id")}
@@ -192,11 +201,14 @@ def before(
                             {
                                 "id": rid,
                                 "content": result.get("content", ""),
-                                "salience": 1.0 - result.get("combined_score", 0.5),
+                                "salience": _rrf_to_salience(
+                                    result.get("combined_score", 0.0)
+                                ),
                                 "kind": result.get("source", "episode"),
                             }
                         )
                         existing_ids.add(rid)
+                timings["search_recall"] = time.perf_counter() - _t0
             except Exception as exc:
                 log.debug("Search-based recall failed: %s", exc)
 
@@ -275,7 +287,31 @@ def before(
         except Exception as exc:
             log.debug("Boot priming failed: %s", exc)
 
+    # -- 8e. Fetch trace embeddings for MMR diversity -------------------------
+    #    Pre-computed embeddings from ChromaDB allow the knapsack allocator
+    #    to penalise near-duplicate traces via Maximal Marginal Relevance.
+    trace_embeddings = None
+    if semantic_search is not None and salient_traces:
+        try:
+            _t0 = time.perf_counter()
+            # ChromaDB stores traces with "trace_" prefix on IDs
+            trace_ids_for_emb = [
+                f"trace_{t['id']}" for t in salient_traces if t.get("id")
+            ]
+            if trace_ids_for_emb:
+                raw_embs = semantic_search.get_embeddings(
+                    trace_ids_for_emb, collection="episodic"
+                )
+                # Map back to bare trace IDs (strip "trace_" prefix)
+                trace_embeddings = {
+                    k.removeprefix("trace_"): v for k, v in raw_embs.items()
+                }
+            timings["fetch_embeddings"] = time.perf_counter() - _t0
+        except Exception as exc:
+            log.debug("Failed to fetch trace embeddings for MMR: %s", exc)
+
     # -- 9. Assemble context -----------------------------------------------
+    _t0 = time.perf_counter()
     ctx = context_builder.build(
         person=person,
         message=message,
@@ -286,7 +322,10 @@ def before(
         salient_traces=salient_traces,
         relevant_skills=relevant_skills,
         correction_prompt=correction_prompt,
+        trace_embeddings=trace_embeddings,
     )
+
+    timings["context_build"] = time.perf_counter() - _t0
 
     # Mark loaded traces as accessed (for decay resistance)
     for tid in ctx.trace_ids:
@@ -295,16 +334,39 @@ def before(
         except Exception as exc:
             log.debug("Failed to update access for trace %s: %s", tid, exc)
 
+    timings["total"] = time.perf_counter() - _t0_total
+    ctx.timings = timings
+
     log.info(
-        "Before pipeline: person=%s, tokens=%d/%d, memories=%d, traces=%d",
+        "Before pipeline: person=%s, tokens=%d/%d, memories=%d, traces=%d, "
+        "total_ms=%.1f",
         person,
         ctx.tokens_used,
         ctx.token_budget,
         ctx.memories_loaded,
         len(ctx.trace_ids),
+        timings["total"] * 1000,
     )
 
     return ctx
+
+
+# ---------------------------------------------------------------------------
+# RRF score conversion
+# ---------------------------------------------------------------------------
+
+
+def _rrf_to_salience(rrf_score: float, k: int = 60) -> float:
+    """Convert an RRF combined_score to a [0, 1] salience value.
+
+    The maximum RRF score is 2/(k+1) when a document is ranked #1 in
+    both FTS and semantic search.  We normalise to [0, 1] by dividing
+    by this theoretical maximum.
+    """
+    max_rrf = 2.0 / (k + 1)
+    if max_rrf <= 0:
+        return 0.5
+    return min(1.0, rrf_score / max_rrf)
 
 
 # ---------------------------------------------------------------------------

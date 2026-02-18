@@ -47,10 +47,15 @@ class SemanticSearch:
         if embedding_func is not None:
             self._ef = _WrappedEmbeddingFunction(embedding_func)
 
-        # Pre-create / get all collections
+        # Pre-create / get all collections.
+        # IMPORTANT: use cosine distance so that distances are in [0, 2]
+        # and the merge logic in unified.py can normalise correctly.
         self._collections: Dict[str, chromadb.Collection] = {}
         for name in COLLECTIONS:
-            kwargs: Dict = {"name": name}
+            kwargs: Dict = {
+                "name": name,
+                "metadata": {"hnsw:space": "cosine"},
+            }
             if self._ef is not None:
                 kwargs["embedding_function"] = self._ef
             self._collections[name] = self._client.get_or_create_collection(**kwargs)
@@ -204,6 +209,51 @@ class SemanticSearch:
         # Sort by distance (lower = more similar)
         all_results.sort(key=lambda r: r["distance"])
         return all_results
+
+    # ------------------------------------------------------------------
+    # Embedding retrieval (for MMR diversity)
+    # ------------------------------------------------------------------
+
+    def get_embeddings(
+        self,
+        doc_ids: List[str],
+        collection: str = "episodic",
+    ) -> Dict[str, List[float]]:
+        """Retrieve pre-computed embeddings for a set of document IDs.
+
+        Returns a mapping ``{doc_id: embedding_vector}`` for every ID
+        that exists in the collection.  IDs not found are silently
+        skipped.
+
+        Used by the knapsack allocator for MMR diversity scoring —
+        no embedding recomputation needed since ChromaDB stores them.
+        """
+        if not doc_ids:
+            return {}
+
+        col = self._get_collection(collection)
+        if col.count() == 0:
+            return {}
+
+        try:
+            results = col.get(
+                ids=doc_ids,
+                include=["embeddings"],
+            )
+        except Exception:
+            return {}
+
+        if not results or not results.get("ids"):
+            return {}
+
+        embeddings: Dict[str, List[float]] = {}
+        ids = results["ids"]
+        embs = results.get("embeddings") or []
+        for i, doc_id in enumerate(ids):
+            if i < len(embs) and embs[i] is not None:
+                embeddings[doc_id] = embs[i]
+
+        return embeddings
 
     # ------------------------------------------------------------------
     # Lifecycle

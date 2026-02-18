@@ -2,7 +2,7 @@
 engram.signal.decay — Adaptive memory decay engine.
 
 Ported from Singularity's memory.py.  Implements exponential decay with
-two modulating factors:
+three modulating factors:
 
   1. **Coherence modulation** — when the system is coherent (high signal
      health), memories decay *faster* because the system is confident and
@@ -13,10 +13,17 @@ two modulating factors:
      decay more slowly.  Frequently-recalled memories are load-bearing
      and should persist.
 
+  3. **Access-recency weighting** (ACT-R-inspired) — old accesses
+     contribute less to resistance than recent ones.  A trace accessed
+     10 times but not touched in 60 days has lower effective access
+     count than one accessed 3 times yesterday.
+
 Decay formula (shared with EpisodicStore.decay_pass):
     decay_rate  = ln(2) / half_life * coherence_factor
     coherence_factor = 0.5 + coherence  (range 0.5 at c=0, 1.5 at c=1)
-    resistance  = 1 / (1 + access_count * 0.1)
+    recent_factor = exp(-ln(2) / 720h * hours_since_last_access)
+    effective_access = access_count * recent_factor
+    resistance  = 1 / (1 + effective_access * 0.1)
     new_salience = salience * exp(-decay_rate * hours * resistance)
 """
 
@@ -37,6 +44,9 @@ class DecayEngine:
     min_salience : float
         Salience floor below which a trace should be pruned (default 0.01).
     """
+
+    # Half-life for access recency weighting (30 days in hours).
+    ACCESS_RECENCY_HALF_LIFE_HOURS: float = 720.0
 
     def __init__(
         self,
@@ -94,7 +104,9 @@ class DecayEngine:
 
         Uses the same formula as ``EpisodicStore.decay_pass()``:
             decay_rate = ln(2) / half_life * coherence_factor
-            resistance = 1 / (1 + access_count * 0.1)
+            recent_factor = exp(-ln(2) / 720h * hours_since_last_access)
+            effective_access = access_count * recent_factor
+            resistance = 1 / (1 + effective_access * 0.1)
             multiplier = exp(-decay_rate * hours * resistance)
 
         Parameters
@@ -125,8 +137,12 @@ class DecayEngine:
         cf = self.coherence_factor()
         decay_rate = math.log(2) / hl * cf
 
-        # Access-frequency resistance
-        resistance = 1.0 / (1.0 + (access_count or 0) * 0.1)
+        # ACT-R-inspired access recency: old accesses fade from
+        # resistance calculation.
+        access_recency_rate = math.log(2) / self.ACCESS_RECENCY_HALF_LIFE_HOURS
+        recent_factor = math.exp(-access_recency_rate * hours_elapsed)
+        effective_access = (access_count or 0) * recent_factor
+        resistance = 1.0 / (1.0 + effective_access * 0.1)
 
         multiplier = math.exp(-decay_rate * hours_elapsed * resistance)
         return max(0.0, min(1.0, multiplier))
