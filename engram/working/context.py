@@ -8,10 +8,11 @@ skills based on the detected query type — then formats everything into
 a single prompt with clear section headers.
 
 Query-type classification (via ``query_classifier``) adjusts shares so:
-  - Greetings use minimal identity, heavy on recent conversation
-  - Memory recall maximizes episodic search results
-  - Technical work maximizes procedural skills
-  - Emotional messages emphasize relationship context
+  - Debugging maximizes past solutions (episodic traces)
+  - Implementing balances relevant code + past solutions
+  - Refactoring maximizes relevant code patterns
+  - Code review maximizes coding standards
+  - Architecture emphasizes project overview + ADRs
   - etc.
 
 This dynamic allocation gives 15-30% better context utilization

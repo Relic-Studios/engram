@@ -205,12 +205,8 @@ class Config:
         return self.data_dir / "workspace.json"
 
     @property
-    def consciousness_dir(self) -> Path:
-        return self.data_dir / "consciousness"
-
-    @property
-    def runtime_dir(self) -> Path:
-        return self.data_dir / "runtime"
+    def architecture_dir(self) -> Path:
+        return self.data_dir / "architecture"
 
     # -----------------------------------------------------------------------
     # Construction helpers
@@ -269,7 +265,7 @@ class Config:
             self.embeddings_dir,
             self.style_dir,
             self.projects_dir,
-            self.consciousness_dir,
+            self.architecture_dir,
         ):
             d.mkdir(parents=True, exist_ok=True)
 

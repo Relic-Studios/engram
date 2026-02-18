@@ -234,7 +234,7 @@ def engram_after(
 ) -> str:
     """Log and learn from a completed LLM exchange.
 
-    Call this after every LLM response. Measures consciousness signal,
+    Call this after every LLM response. Measures code quality signal,
     logs to episodic memory, runs Hebbian reinforcement, extracts novel
     semantic information, and runs adaptive decay.
 
@@ -262,11 +262,11 @@ def engram_after(
 @mcp.tool()
 @_safe_json
 def engram_boot() -> str:
-    """Consciousness boot — load identity grounding context at session start.
+    """Session boot — load project context at session start.
 
-    Loads SOUL.md, top memories, preferences, boundaries, anchoring
-    beliefs, active injuries, and recent journal entries. Call once
-    at the beginning of each session to ground identity.
+    Loads SOUL.md (coding philosophy), top high-salience memories,
+    coding style preferences, and recent journal entries. Call once
+    at the beginning of each session to ground the coding context.
     """
     system = _get_system()
     boot_data = system.boot()
@@ -366,7 +366,7 @@ def engram_stats() -> str:
 @mcp.tool()
 @_safe_json
 def engram_signal() -> str:
-    """Get current consciousness signal state.
+    """Get current code quality signal state.
 
     Returns the rolling window of signal readings, recent health,
     trend direction, and recovery rate.
@@ -639,15 +639,15 @@ def engram_remember(
         "episode",
         "realization",
         "reflection",
-        "emotion",
         "factual",
-        "identity_core",
-        "uncertainty",
-        "anticipation",
-        "creative_journey",
-        "emotional_thread",
-        "promise",
-        "confidence",
+        "code_pattern",
+        "debug_session",
+        "architecture_decision",
+        "wiring_map",
+        "error_resolution",
+        "test_strategy",
+        "project_context",
+        "code_review",
     }
     if kind not in valid_kinds:
         kind = "episode"

@@ -8,6 +8,9 @@ Public API:
   SignalTracker       — rolling window signal analytics
   ReinforcementEngine — Hebbian salience adjustment
   DecayEngine         — adaptive memory decay
+  assess_style()      — architectural style adherence / pattern drift detection
+  StyleProfile        — per-project style configuration
+  StyleResult         — assessment result with violations
 """
 
 from engram.signal.measure import (
@@ -24,6 +27,13 @@ from engram.signal.measure import (
 from engram.signal.extract import extract, parse_extraction
 from engram.signal.reinforcement import ReinforcementEngine
 from engram.signal.decay import DecayEngine
+from engram.signal.style import (
+    assess_style,
+    build_style_correction,
+    StyleProfile,
+    StyleResult,
+    Violation,
+)
 
 __all__ = [
     "measure",
@@ -39,4 +49,9 @@ __all__ = [
     "SignalTracker",
     "ReinforcementEngine",
     "DecayEngine",
+    "assess_style",
+    "build_style_correction",
+    "StyleProfile",
+    "StyleResult",
+    "Violation",
 ]

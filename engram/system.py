@@ -418,31 +418,59 @@ class MemorySystem:
 
     def boot(self) -> Dict:
         """
-        Code-first boot — load project context and recent session data.
+        Code-first boot — load project context and session priming data.
 
-        Loads SOUL.md (coding philosophy), recent high-salience traces
-        (ADRs, coding patterns), preferences, and recent journal entries.
+        Loads SOUL.md (coding philosophy), active ADRs (architecture
+        decision records), recent high-salience traces, coding style
+        preferences, active workspace items, recent sessions, and
+        code quality signal health.
+
+        This is the "contextual priming" step from the buildplan:
+        ensures the agent starts each session with full awareness of
+        the project's architecture, active decisions, and recent work.
         """
         soul_text = self.semantic.get_identity()
 
-        # High-salience traces (ADRs, code patterns, important decisions)
+        # --- ADRs: highest-priority project context ---
+        # Architecture decisions are assigned high initial salience
+        # and should always be present during relevant tasks.
+        adrs = self.episodic.get_traces_by_kind(
+            "architecture_decision", limit=5, min_salience=0.3
+        )
+
+        # --- High-salience traces (code patterns, debug sessions, etc) ---
         top_traces = self.episodic.get_by_salience(limit=10)
 
-        # Get preferences (coding style preferences)
+        # --- Coding style preferences ---
         prefs = self.semantic.get_preferences()
 
-        # Recent journal entries
+        # --- Recent journal entries (processed reflections) ---
         recent_journal = self.journal.list_entries(limit=3)
 
-        # Signal health (code quality trend)
+        # --- Recent sessions (what was worked on recently) ---
+        recent_sessions = self.episodic.get_recent_sessions(
+            limit=self.config.boot_n_sessions
+        )
+
+        # --- Active workspace items (current mental context) ---
+        workspace_items = []
+        try:
+            workspace_items = self.workspace.items(n=5)
+        except Exception:
+            pass
+
+        # --- Code quality signal health ---
         signal_health = self.signal_tracker.recent_health()
         signal_trend = self.signal_tracker.trend()
 
         return {
             "soul": soul_text[:3000] if soul_text else "",
+            "architecture_decisions": adrs,
             "top_memories": top_traces,
             "preferences_summary": prefs[:500] if prefs else "",
             "recent_journal": recent_journal,
+            "recent_sessions": recent_sessions,
+            "workspace_items": workspace_items,
             "signal_health": signal_health,
             "signal_trend": signal_trend,
         }

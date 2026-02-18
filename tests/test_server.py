@@ -133,9 +133,12 @@ class TestEngramBoot:
         data = json.loads(result)
         expected_keys = {
             "soul",
+            "architecture_decisions",
             "top_memories",
             "preferences_summary",
             "recent_journal",
+            "recent_sessions",
+            "workspace_items",
             "signal_health",
             "signal_trend",
         }

@@ -133,12 +133,15 @@ class TestMemorySystem:
         assert signal["count"] == 3
 
     def test_boot(self, memory):
-        """Boot returns grounding context."""
+        """Boot returns project context and priming data."""
         boot_data = memory.boot()
         assert "soul" in boot_data
+        assert "architecture_decisions" in boot_data
         assert "top_memories" in boot_data
         assert "preferences_summary" in boot_data
         assert "recent_journal" in boot_data
+        assert "recent_sessions" in boot_data
+        assert "workspace_items" in boot_data
         assert "signal_health" in boot_data
         assert "signal_trend" in boot_data
 
