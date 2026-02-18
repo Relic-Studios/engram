@@ -1,0 +1,84 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Engram data (user data should not be committed)
+engram_data/
+*.db
+*.db-wal
+*.db-shm
+
+# ChromaDB embeddings
+embeddings/
+chroma_data/
+
+# Backups
+*.bak
+
+# ===== API KEYS & SECRETS =====
+# Environment files
+.env
+.env.*
+!.env.example
+secrets.env
+secrets.yaml
+secrets.json
+
+# API key storage
+**/api_keys/
+**/credentials/
+**/keys/
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Config files that might contain keys
+config.local.yaml
+config.local.json
+engram.local.yaml
+
+# Safety data (may contain personal information)
+safety/
+
+# Test artifacts
+test_data/
+Devengramtest_data/
+.pytest_cache/
+htmlcov/
+.coverage
+
+# Editor/tool artifacts
+.skill-registry.json
+unreal_mcp.log
+*.log
+
+# Ruff cache
+.ruff_cache/
+
+# Internal notes
+CODEGRAM_CONVERSION.md

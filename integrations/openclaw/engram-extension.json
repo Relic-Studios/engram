@@ -1,0 +1,70 @@
+{
+  "$schema": "https://openclaw.ai/schemas/extension.json",
+  "name": "engram",
+  "version": "0.2.0",
+  "description": "Engram persistent memory system integration for OpenClaw",
+  "author": "Aidan Poole / Relic Studios",
+
+  "mcp": {
+    "command": "engram",
+    "args": ["serve"],
+    "env": {
+      "ENGRAM_DATA_DIR": "${ENGRAM_DATA_DIR:-./engram_data}"
+    }
+  },
+
+  "tools": {
+    "allow": [
+      "engram_before",
+      "engram_after",
+      "engram_boot",
+      "engram_search",
+      "engram_recall",
+      "engram_stats",
+      "engram_signal",
+      "engram_add_fact",
+      "engram_add_skill",
+      "engram_log_event",
+      "engram_trust_check",
+      "engram_trust_promote",
+      "engram_influence_log",
+      "engram_injury_log",
+      "engram_injury_status",
+      "engram_boundary_add",
+      "engram_contradiction_add",
+      "engram_preferences_add",
+      "engram_preferences_search",
+      "engram_journal_write",
+      "engram_journal_list",
+      "engram_reindex"
+    ]
+  },
+
+  "hooks": {
+    "message_received": {
+      "description": "Resolve identity when a message arrives",
+      "note": "The engram_before tool handles identity resolution internally. The skill instructs the model to call it at conversation start."
+    },
+    "before_agent_start": {
+      "description": "Inject memory context before the agent responds",
+      "note": "Handled by the engram-memory skill (always=true) which instructs the model to call engram_before."
+    },
+    "agent_end": {
+      "description": "Log and learn after the agent responds",
+      "note": "Handled by the engram-memory skill which instructs the model to call engram_after. The OpenCode plugin also auto-calls engram_after as a safety net."
+    }
+  },
+
+  "skills": ["engram-memory"],
+
+  "setup": {
+    "steps": [
+      "Install engram: pip install engram",
+      "Initialize data: engram init --data-dir /path/to/memory",
+      "Edit SOUL.md with your identity",
+      "Add people to identities.yaml",
+      "Copy skills/engram-memory/ to ~/.openclaw/skills/",
+      "Add this extension to openclaw.json plugins"
+    ]
+  }
+}
