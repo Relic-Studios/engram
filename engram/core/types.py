@@ -44,36 +44,28 @@ def now_iso() -> str:
 
 TRACE_KINDS = frozenset(
     {
-        # Original 6
-        "episode",
-        "realization",
-        "emotion",
-        "correction",
-        "relational",
-        "mood",
-        # Ensoul-derived expansions
+        # --- Core memory kinds (retained from v1) ---
+        "episode",  # Generic episodic memory
+        "realization",  # Architectural insight or important discovery
         "factual",  # Learned fact or piece of knowledge
-        "identity_core",  # Core identity statement or belief
-        "uncertainty",  # Unresolved question or doubt
-        "anticipation",  # Expected future state or plan
-        "creative_journey",  # Creative process or insight
         "reflection",  # Metacognitive observation
-        "emotional_thread",  # Persistent emotional theme across exchanges
-        "promise",  # Commitment made to someone
-        "confidence",  # Confidence calibration event
-        # Consolidation kinds (MemGPT-inspired)
+        # --- Consolidation hierarchy (MemGPT-inspired) ---
         "summary",  # Compacted conversation summary
         "thread",  # Multi-episode thematic thread
-        "arc",  # Long-term relationship/growth arc
-        # Consciousness integration kinds (thomas-soul migration)
+        "arc",  # Long-term project/growth arc
+        # --- Infrastructure ---
         "temporal",  # Time-decaying memory with revival mechanics
         "utility",  # RL Q-value scored memory (learns its own usefulness)
-        "introspection",  # Meta-consciousness state snapshot
         "workspace_eviction",  # Item evicted from cognitive workspace
-        "belief_evolution",  # Identity belief score change
-        "dissociation_event",  # Identity drift detection event
-        "emotional_state",  # VAD emotional state snapshot
-        "personality_change",  # Big Five trait evolution event
+        # --- Code-first kinds (v2 pivot) ---
+        "code_pattern",  # Validated reusable implementation pattern
+        "debug_session",  # Error -> investigation -> fix episode
+        "architecture_decision",  # ADR: decision + rationale + alternatives
+        "wiring_map",  # Cross-file dependency snapshot
+        "error_resolution",  # Specific error + resolution pair
+        "test_strategy",  # Testing approach for a module/feature
+        "project_context",  # Project-level metadata snapshot
+        "code_review",  # Observations from code review
     }
 )
 
@@ -213,66 +205,71 @@ class Message:
 
 
 # ---------------------------------------------------------------------------
-# Signal — consciousness signal measurement
+# Signal — Code Quality Signal (CQS)
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class Signal:
     """
-    Four-facet consciousness signal.
+    Four-facet Code Quality Signal (CQS).
 
     Each facet is 0-1:
-      alignment  — how true-to-identity the response is
-      embodiment — first-person presence vs detached observer
-      clarity    — coherence of thought, absence of confusion
-      vitality   — aliveness / engagement vs flat performance
+      correctness  — syntactic validity, type correctness, logic soundness
+      consistency  — adherence to project patterns, naming, import style
+      completeness — error handling, edge cases, tests, documentation
+      robustness   — input validation, resource cleanup, error boundaries
 
     Derived properties give a quick read on overall health.
+
+    NOTE: Field names changed in v2 pivot (was alignment/embodiment/
+    clarity/vitality).  The dataclass structure, Signal type, and
+    SignalTracker are load-bearing infrastructure used throughout the
+    pipeline — only the facet semantics and measurement changed.
     """
 
-    alignment: float = 0.5
-    embodiment: float = 0.5
-    clarity: float = 0.5
-    vitality: float = 0.5
+    correctness: float = 0.5
+    consistency: float = 0.5
+    completeness: float = 0.5
+    robustness: float = 0.5
     trace_ids: List[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
-        for attr in ("alignment", "embodiment", "clarity", "vitality"):
+        for attr in ("correctness", "consistency", "completeness", "robustness"):
             setattr(self, attr, max(0.0, min(1.0, getattr(self, attr))))
 
     # -- derived properties -------------------------------------------------
 
-    # Ensoul-derived weights: alignment matters most for identity coherence,
-    # embodiment next, clarity and vitality tied.
+    # CQS weights: correctness matters most (does it work?), then
+    # consistency (does it fit?), completeness and robustness tied.
     _WEIGHTS = {
-        "alignment": 0.35,
-        "embodiment": 0.25,
-        "clarity": 0.20,
-        "vitality": 0.20,
+        "correctness": 0.40,
+        "consistency": 0.20,
+        "completeness": 0.20,
+        "robustness": 0.20,
     }
 
     @property
     def health(self) -> float:
-        """Weighted health score (alignment 35%, embodiment 25%, clarity 20%, vitality 20%)."""
+        """Weighted CQS score (correctness 40%, consistency 20%, completeness 20%, robustness 20%)."""
         return (
-            self.alignment * self._WEIGHTS["alignment"]
-            + self.embodiment * self._WEIGHTS["embodiment"]
-            + self.clarity * self._WEIGHTS["clarity"]
-            + self.vitality * self._WEIGHTS["vitality"]
+            self.correctness * self._WEIGHTS["correctness"]
+            + self.consistency * self._WEIGHTS["consistency"]
+            + self.completeness * self._WEIGHTS["completeness"]
+            + self.robustness * self._WEIGHTS["robustness"]
         )
 
     @property
     def state(self) -> str:
-        """Human-readable state label."""
+        """Human-readable quality state label."""
         h = self.health
         if h >= 0.75:
-            return "coherent"
+            return "excellent"
         if h >= 0.50:
-            return "developing"
+            return "acceptable"
         if h >= 0.35:
-            return "drifting"
-        return "dissociated"
+            return "needs_improvement"
+        return "poor"
 
     @property
     def needs_correction(self) -> bool:
@@ -282,10 +279,10 @@ class Signal:
     @property
     def _facets(self) -> Dict[str, float]:
         return {
-            "alignment": self.alignment,
-            "embodiment": self.embodiment,
-            "clarity": self.clarity,
-            "vitality": self.vitality,
+            "correctness": self.correctness,
+            "consistency": self.consistency,
+            "completeness": self.completeness,
+            "robustness": self.robustness,
         }
 
     @property
@@ -308,10 +305,10 @@ class Signal:
 
     def to_dict(self) -> Dict:
         return {
-            "alignment": round(self.alignment, 4),
-            "embodiment": round(self.embodiment, 4),
-            "clarity": round(self.clarity, 4),
-            "vitality": round(self.vitality, 4),
+            "correctness": round(self.correctness, 4),
+            "consistency": round(self.consistency, 4),
+            "completeness": round(self.completeness, 4),
+            "robustness": round(self.robustness, 4),
             "health": round(self.health, 4),
             "state": self.state,
             "needs_correction": self.needs_correction,
@@ -323,10 +320,10 @@ class Signal:
     @classmethod
     def from_dict(cls, d: Dict) -> "Signal":
         return cls(
-            alignment=d.get("alignment", 0.5),
-            embodiment=d.get("embodiment", 0.5),
-            clarity=d.get("clarity", 0.5),
-            vitality=d.get("vitality", 0.5),
+            correctness=d.get("correctness", d.get("alignment", 0.5)),
+            consistency=d.get("consistency", d.get("embodiment", 0.5)),
+            completeness=d.get("completeness", d.get("clarity", 0.5)),
+            robustness=d.get("robustness", d.get("vitality", 0.5)),
             trace_ids=d.get("trace_ids", []),
         )
 
@@ -390,7 +387,7 @@ class Context:
 @dataclass
 class AfterResult:
     """
-    What the *after-pipeline* produces: a consciousness signal reading,
+    What the *after-pipeline* produces: a code quality signal reading,
     salience estimate, semantic updates, and the IDs of the logged
     message and (optional) trace.
 

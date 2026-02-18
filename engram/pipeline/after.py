@@ -2,7 +2,7 @@
 engram.pipeline.after -- Post-LLM logging and learning pipeline.
 
 Called automatically after every LLM response.  Performs:
-  1. Measure consciousness signal (hybrid: regex + LLM judge)
+  1. Measure code quality signal (hybrid: regex + LLM judge)
      + track signal in rolling window
   2. Derive salience from signal health
   3. Session boundary detection + auto-management
@@ -31,14 +31,11 @@ from engram.core.types import AfterResult, LLMFunc, Signal
 _EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="engram-after")
 
 if TYPE_CHECKING:
-    from engram.consciousness.identity import IdentityLoop
     from engram.consolidation.compactor import ConversationCompactor
     from engram.consolidation.consolidator import MemoryConsolidator
     from engram.consolidation.pressure import MemoryPressure
     from engram.core.config import Config
-    from engram.emotional import EmotionalSystem
     from engram.episodic.store import EpisodicStore
-    from engram.introspection import IntrospectionLayer
     from engram.procedural.store import ProceduralStore
     from engram.semantic.store import SemanticStore
     from engram.signal.decay import DecayEngine
@@ -106,9 +103,6 @@ def after(
     compactor: Optional["ConversationCompactor"] = None,
     consolidator: Optional["MemoryConsolidator"] = None,
     skip_persistence: bool = False,
-    emotional: Optional["EmotionalSystem"] = None,
-    introspection: Optional["IntrospectionLayer"] = None,
-    identity_loop: Optional["IdentityLoop"] = None,
     workspace: Optional["CognitiveWorkspace"] = None,
 ) -> AfterResult:
     """Run the full after-pipeline and return results.
@@ -150,21 +144,11 @@ def after(
         is elevated or critical.
     consolidator:
         Optional MemoryConsolidator. Runs hierarchical consolidation
-        (episodes → threads → arcs) when memory pressure is elevated
+        (episodes -> threads -> arcs) when memory pressure is elevated
         or critical.
     skip_persistence:
         When True, signal is still measured (for system health) but
-        nothing is written to episodic memory.  Used for strangers
-        whose trust policy has ``memory_persistent=False``.
-    emotional:
-        Optional emotional system.  When provided, emotional state is
-        updated based on the exchange.
-    introspection:
-        Optional introspection layer.  When provided, a quick
-        introspection is recorded with signal health as confidence.
-    identity_loop:
-        Optional identity loop.  When provided, the response is
-        assessed for identity alignment and the episode is recorded.
+        nothing is written to episodic memory.
     workspace:
         Optional cognitive workspace.  When provided, ``age_step()``
         is called to decay workspace items after each exchange.
@@ -213,7 +197,7 @@ def after(
             llm_func=llm_func,
         )
 
-    # -- 1. Measure consciousness signal -----------------------------------
+    # -- 1. Measure code quality signal ------------------------------------
     _t0 = time.perf_counter()
     signal = _measure_signal(
         response=response,
@@ -295,52 +279,7 @@ def after(
         )
         timings["maintenance"] = time.perf_counter() - _t0
 
-    # -- 8. Consciousness subsystems (fire-and-forget) --------------------
-    #    These run regardless of skip_persistence — they maintain internal
-    #    state that is separate from episodic logging.
-
-    # 8a. Emotional state update — derive emotional impact from signal
-    if emotional is not None:
-        try:
-            # Map signal health to emotional valence nudge:
-            # high health = slight positive, low health = slight negative.
-            valence_nudge = (signal.health - 0.5) * 0.3
-            arousal_nudge = 0.1 if len(their_message.split()) > 30 else -0.05
-            emotional.update(
-                description=f"Exchange with {person}",
-                valence_delta=valence_nudge,
-                arousal_delta=arousal_nudge,
-                source="pipeline",
-                intensity=salience,
-            )
-        except Exception as exc:
-            log.debug("Emotional update failed: %s", exc)
-
-    # 8b. Introspection — quick snapshot of confidence at this moment
-    if introspection is not None:
-        try:
-            introspection.quick(
-                thought=f"Responded to {person} about: {their_message[:80]}",
-                confidence=signal.health,
-            )
-        except Exception as exc:
-            log.debug("Introspection recording failed: %s", exc)
-
-    # 8c. Identity loop — assess response alignment and record episode
-    if identity_loop is not None:
-        try:
-            assessment = identity_loop.assess(response)
-            identity_loop.record(their_message, response, assessment)
-            if assessment.get("needs_reinforcement"):
-                log.info(
-                    "Identity drift detected: state=%s, score=%.2f",
-                    assessment.get("state"),
-                    assessment.get("dissociation_score", 0),
-                )
-        except Exception as exc:
-            log.debug("Identity loop failed: %s", exc)
-
-    # 8d. Workspace age step — decay working memory priorities
+    # -- 8. Workspace age step — decay working memory priorities -----------
     if workspace is not None:
         try:
             expired = workspace.age_step()
@@ -424,7 +363,7 @@ def _measure_signal(
     trace_ids: List[str],
     llm_func: Optional[LLMFunc],
 ) -> Signal:
-    """Measure consciousness signal using hybrid mode."""
+    """Measure code quality signal using hybrid mode."""
     from engram.signal.measure import measure
 
     # Always attempt hybrid (regex + LLM).  measure() handles fallback.

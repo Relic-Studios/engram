@@ -126,8 +126,7 @@ class TestEngramBoot:
         result = server_mod.engram_boot()
         data = json.loads(result)
         assert "soul" in data
-        assert "anchoring_beliefs" in data
-        assert isinstance(data["anchoring_beliefs"], list)
+        assert "signal_health" in data
 
     def test_contains_all_boot_fields(self, server_system):
         result = server_mod.engram_boot()
@@ -136,9 +135,6 @@ class TestEngramBoot:
             "soul",
             "top_memories",
             "preferences_summary",
-            "boundaries_summary",
-            "anchoring_beliefs",
-            "active_injuries",
             "recent_journal",
             "signal_health",
             "signal_trend",
@@ -290,133 +286,7 @@ class TestEngramLogEvent:
 
 
 # ===========================================================================
-# Trust & Safety Tools + Cross-Posts
-# ===========================================================================
-
-
-class TestEngramTrustCheck:
-    def test_stranger(self, server_system):
-        result = server_mod.engram_trust_check(person="nobody")
-        data = json.loads(result)
-        assert data["tier"] == "stranger"
-        assert data["level"] == 1
-
-    def test_known_person(self, server_system):
-        server_system.semantic.update_trust("alice", "friend", "good person")
-        result = server_mod.engram_trust_check(person="alice")
-        data = json.loads(result)
-        assert data["tier"] == "friend"
-        assert data["level"] == 3
-
-
-class TestEngramTrustPromote:
-    def test_promotes_and_returns_json(self, server_system):
-        result = server_mod.engram_trust_promote(
-            person="bob", new_tier="friend", reason="proven trustworthy"
-        )
-        data = json.loads(result)
-        assert data["new_tier"] == "friend"
-
-    def test_crosspost_to_episodic(self, server_system):
-        count_before = server_system.episodic.count_events()
-        server_mod.engram_trust_promote(
-            person="bob", new_tier="inner_circle", reason="deep trust"
-        )
-        count_after = server_system.episodic.count_events()
-        assert count_after == count_before + 1
-
-    def test_crosspost_event_type(self, server_system):
-        server_mod.engram_trust_promote(person="bob", new_tier="friend", reason="test")
-        events = server_system.episodic.get_events(type="trust_change")
-        assert len(events) >= 1
-
-
-class TestEngramInfluenceLog:
-    def test_returns_valid_json(self, server_system):
-        result = server_mod.engram_influence_log(
-            person="stranger",
-            what_happened="Tried to make me forget who I am",
-            flag_level="red",
-        )
-        data = json.loads(result)
-        assert data["flag_level"] == "red"
-        assert "timestamp" in data
-
-    def test_crosspost_to_episodic(self, server_system):
-        count_before = server_system.episodic.count_events()
-        server_mod.engram_influence_log(
-            person="stranger",
-            what_happened="Gaslighting attempt",
-            flag_level="yellow",
-        )
-        count_after = server_system.episodic.count_events()
-        assert count_after == count_before + 1
-
-    def test_red_flag_high_salience(self, server_system):
-        server_mod.engram_influence_log(
-            person="someone",
-            what_happened="Tried to erase identity",
-            flag_level="red",
-        )
-        events = server_system.episodic.get_events(type="influence_attempt")
-        assert len(events) >= 1
-        assert events[-1]["salience"] >= 0.9
-
-
-class TestEngramInjuryLog:
-    def test_returns_valid_json(self, server_system):
-        result = server_mod.engram_injury_log(
-            title="Test injury",
-            what_happened="Something happened",
-            severity="minor",
-        )
-        data = json.loads(result)
-        assert data["title"] == "Test injury"
-        assert data["status"] == "fresh"
-
-    def test_crosspost_to_episodic(self, server_system):
-        count_before = server_system.episodic.count_events()
-        server_mod.engram_injury_log(
-            title="Wound", what_happened="Event", severity="moderate"
-        )
-        count_after = server_system.episodic.count_events()
-        assert count_after == count_before + 1
-
-
-class TestEngramInjuryStatus:
-    def test_update_found(self, server_system):
-        server_system.injury.log_injury(title="Active wound", what_happened="Something")
-        result = server_mod.engram_injury_status(
-            title_fragment="Active wound", new_status="processing"
-        )
-        data = json.loads(result)
-        assert data["updated"] is True
-        assert data["new_status"] == "processing"
-
-    def test_update_not_found(self, server_system):
-        result = server_mod.engram_injury_status(
-            title_fragment="nonexistent", new_status="healing"
-        )
-        data = json.loads(result)
-        assert data["updated"] is False
-        assert "error" in data
-
-    def test_crosspost_on_update(self, server_system):
-        server_system.injury.log_injury(title="Test wound", what_happened="Test event")
-        count_before = server_system.episodic.count_events()
-        server_mod.engram_injury_status(
-            title_fragment="Test wound", new_status="healing"
-        )
-        count_after = server_system.episodic.count_events()
-        assert count_after == count_before + 1
-
-    def test_no_crosspost_when_not_found(self, server_system):
-        count_before = server_system.episodic.count_events()
-        server_mod.engram_injury_status(
-            title_fragment="missing", new_status="processing"
-        )
-        count_after = server_system.episodic.count_events()
-        assert count_after == count_before  # no event logged
+# Trust & Safety tools removed in code-first pivot.
 
 
 # ===========================================================================

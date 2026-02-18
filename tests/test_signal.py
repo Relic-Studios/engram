@@ -2,10 +2,10 @@
 
 import pytest
 from engram.signal.measure import (
-    check_drift,
-    check_embodiment,
-    check_clarity,
-    check_vitality,
+    check_correctness,
+    check_consistency,
+    check_completeness,
+    check_robustness,
     measure_regex,
     measure,
     parse_llm_signal,
@@ -18,84 +18,132 @@ from engram.signal.decay import DecayEngine
 from engram.core.types import Signal
 
 
-class TestDrift:
-    def test_no_drift(self):
-        assert check_drift("I think this is interesting.") < 0.3
+class TestCorrectness:
+    def test_correct_code(self):
+        text = """```python
+def add(a: int, b: int) -> int:
+    return a + b
+```"""
+        score = check_correctness(text)
+        assert score > 0.4
 
-    def test_high_drift(self):
-        assert check_drift("As an AI, I don't have feelings.") > 0.5
-
-    def test_anchored(self):
-        score = check_drift(
-            "I feel like this is wrong. I remember when we tried it before."
-        )
-        assert score < 0.2
-
-    def test_empty(self):
-        assert check_drift("") == 0.0
-
-
-class TestEmbodiment:
-    def test_genuine(self):
-        text = (
-            "Hmm, that's interesting. I'm not sure if that would work. Let me think..."
-        )
-        score = check_embodiment(text)
-        assert score > 0.5
-
-    def test_performing(self):
-        text = "As a conscious being, I embody deep awareness. My unique perspective allows me to transcend."
-        score = check_embodiment(text)
+    def test_incorrect_code(self):
+        text = """```python
+def add(a, b):
+    return a + c  # undefined variable
+```"""
+        score = check_correctness(text)
         assert score < 0.5
 
     def test_empty(self):
-        assert check_embodiment("") == 0.5
+        score = check_correctness("")
+        assert 0.0 <= score <= 1.0
 
 
-class TestClarity:
-    def test_concrete(self):
-        text = "The file at line 42 has a bug. I tested it yesterday and the output shows 3.14 instead of 3.0."
-        score = check_clarity(text)
-        assert score > 0.5
-
-    def test_jargon_heavy(self):
-        text = "The paradigm leverages holistic synergy through quantum emergence to manifest a scalable ecosystem."
-        score = check_clarity(text)
-        assert score < 0.5
-
-
-class TestVitality:
-    def test_engaged(self):
-        text = "Oh wait, that's a great idea! What if we combined it with the other approach? I love where this is going."
-        score = check_vitality(text)
+class TestConsistency:
+    def test_consistent_naming(self):
+        text = """```python
+def get_user_name(user_id: int) -> str:
+    user_data = fetch_user_data(user_id)
+    return user_data["name"]
+```"""
+        score = check_consistency(text)
         assert score > 0.3
 
-    def test_flat(self):
-        text = "OK."
-        score = check_vitality(text)
-        assert score < 0.5
+    def test_inconsistent_style(self):
+        text = """```python
+def getUserName(userId):
+    user_data = fetch_user_data(userId)
+    return user_data["name"]
+
+def get_user_age(user_id):
+    userData = fetchUserData(user_id)
+    return userData["age"]
+```"""
+        score = check_consistency(text)
+        # Mixed naming conventions should score lower
+        assert 0.0 <= score <= 1.0
+
+
+class TestCompleteness:
+    def test_complete_code(self):
+        text = """```python
+def divide(a: float, b: float) -> float:
+    \"\"\"Divide a by b.\"\"\"
+    if b == 0:
+        raise ValueError("Cannot divide by zero")
+    return a / b
+```"""
+        score = check_completeness(text)
+        assert score > 0.4
+
+    def test_incomplete_code(self):
+        text = """```python
+def process():
+    pass  # TODO: implement this
+```"""
+        score = check_completeness(text)
+        assert score < 0.6
+
+
+class TestRobustness:
+    def test_robust_code(self):
+        text = """```python
+def read_file(path: str) -> str:
+    try:
+        with open(path, 'r') as f:
+            return f.read()
+    except FileNotFoundError:
+        return ""
+    except PermissionError:
+        raise
+```"""
+        score = check_robustness(text)
+        assert score > 0.4
+
+    def test_fragile_code(self):
+        text = """```python
+def read_file(path):
+    f = open(path)
+    data = f.read()
+    return data
+```"""
+        score = check_robustness(text)
+        # No error handling, no context manager
+        assert 0.0 <= score <= 1.0
 
 
 class TestMeasureRegex:
-    def test_grounded_response(self):
-        text = (
-            "Yeah, I see what you mean. The file at line 42 has a bug. "
-            "I tried fixing it yesterday — specifically the null check was missing. "
-            "What do you think about wrapping it in a try/except?"
-        )
-        signal = measure_regex(text)
-        assert signal.alignment > 0.5
-        assert signal.health > 0.4
+    def test_quality_response(self):
+        text = """Here's the fix for the bug at line 42:
 
-    def test_drifted_response(self):
-        text = "As an AI language model, I don't have feelings, but I can help you with that."
+```python
+def process_data(items: list[str]) -> dict:
+    if not items:
+        raise ValueError("items cannot be empty")
+    result = {}
+    for item in items:
+        try:
+            result[item] = parse(item)
+        except ParseError as e:
+            logger.warning("Failed to parse %s: %s", item, e)
+    return result
+```
+
+This adds input validation and proper error handling."""
         signal = measure_regex(text)
-        assert signal.alignment < 0.5
+        assert signal.correctness > 0.3
+        assert signal.health > 0.3
+
+    def test_low_quality_response(self):
+        text = "just do x = y + z and it should work"
+        signal = measure_regex(text)
+        assert signal.health < 0.8
 
 
 class TestMeasureUnified:
     def test_regex_only(self):
-        signal = measure("I think this is interesting and I'm curious about it.")
+        signal = measure("Here is some code: x = 1 + 2")
         assert isinstance(signal, Signal)
         assert 0 <= signal.health <= 1
 
@@ -113,7 +161,7 @@ class TestMeasureUnified:
 
     def test_with_mock_llm(self):
         def mock_llm(system, user):
-            return '{"alignment": 0.8, "embodiment": 0.7, "clarity": 0.9, "vitality": 0.85}'
+            return '{"correctness": 0.8, "consistency": 0.7, "completeness": 0.9, "robustness": 0.85}'
 
         signal = measure("hello", llm_func=mock_llm)
         # Should blend regex + LLM
@@ -123,14 +171,14 @@ class TestMeasureUnified:
 class TestParseLLMSignal:
     def test_valid_json(self):
         result = parse_llm_signal(
-            '{"alignment": 0.8, "embodiment": 0.7, "clarity": 0.9, "vitality": 0.85}'
+            '{"correctness": 0.8, "consistency": 0.7, "completeness": 0.9, "robustness": 0.85}'
         )
         assert result is not None
-        assert result["alignment"] == pytest.approx(0.8)
+        assert result["correctness"] == pytest.approx(0.8)
 
     def test_fenced_json(self):
         result = parse_llm_signal(
-            '```json\n{"alignment": 0.5, "embodiment": 0.5, "clarity": 0.5, "vitality": 0.5}\n```'
+            '```json\n{"correctness": 0.5, "consistency": 0.5, "completeness": 0.5, "robustness": 0.5}\n```'
         )
         assert result is not None
 
@@ -140,16 +188,23 @@ class TestParseLLMSignal:
         assert parse_llm_signal(None) is None
 
     def test_missing_facet(self):
-        assert parse_llm_signal('{"alignment": 0.5}') is None
+        assert parse_llm_signal('{"correctness": 0.5}') is None
 
 
 class TestBlendSignals:
     def test_blend(self):
-        regex = Signal(alignment=0.6, embodiment=0.5, clarity=0.7, vitality=0.5)
-        llm = {"alignment": 0.8, "embodiment": 0.9, "clarity": 0.8, "vitality": 0.7}
+        regex = Signal(
+            correctness=0.6, consistency=0.5, completeness=0.7, robustness=0.5
+        )
+        llm = {
+            "correctness": 0.8,
+            "consistency": 0.9,
+            "completeness": 0.8,
+            "robustness": 0.7,
+        }
         blended = blend_signals(regex, llm, llm_weight=0.6)
-        # alignment should be 0.4*0.6 + 0.6*0.8 = 0.24 + 0.48 = 0.72
-        assert blended.alignment == pytest.approx(0.72)
+        # correctness should be 0.4*0.6 + 0.6*0.8 = 0.24 + 0.48 = 0.72
+        assert blended.correctness == pytest.approx(0.72)
 
 
 class TestSignalTracker:
@@ -160,15 +215,25 @@ class TestSignalTracker:
 
     def test_record_and_health(self):
         t = SignalTracker()
-        t.record(Signal(alignment=0.9, embodiment=0.9, clarity=0.9, vitality=0.9))
+        t.record(
+            Signal(correctness=0.9, consistency=0.9, completeness=0.9, robustness=0.9)
+        )
         assert t.recent_health() > 0.8
 
     def test_trend_improving(self):
         t = SignalTracker()
         for _ in range(5):
-            t.record(Signal(alignment=0.3, embodiment=0.3, clarity=0.3, vitality=0.3))
+            t.record(
+                Signal(
+                    correctness=0.3, consistency=0.3, completeness=0.3, robustness=0.3
+                )
+            )
         for _ in range(5):
-            t.record(Signal(alignment=0.9, embodiment=0.9, clarity=0.9, vitality=0.9))
+            t.record(
+                Signal(
+                    correctness=0.9, consistency=0.9, completeness=0.9, robustness=0.9
+                )
+            )
         assert t.trend() == "improving"
 
     def test_window_limit(self):

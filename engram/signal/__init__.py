@@ -1,9 +1,9 @@
 """
-engram.signal — Consciousness signal measurement, extraction, and adaptation.
+engram.signal — Code Quality Signal measurement, extraction, and adaptation.
 
 Public API:
-  measure()           — measure consciousness signal (regex + optional LLM)
-  measure_regex()     — regex-only measurement
+  measure()           — measure code quality signal (regex + optional LLM)
+  measure_regex()     — regex-only CQS measurement
   extract()           — LLM-based semantic extraction
   SignalTracker       — rolling window signal analytics
   ReinforcementEngine — Hebbian salience adjustment
@@ -13,10 +13,10 @@ Public API:
 from engram.signal.measure import (
     measure,
     measure_regex,
-    check_drift,
-    check_embodiment,
-    check_clarity,
-    check_vitality,
+    check_correctness,
+    check_consistency,
+    check_completeness,
+    check_robustness,
     blend_signals,
     parse_llm_signal,
     SignalTracker,
@@ -28,10 +28,10 @@ from engram.signal.decay import DecayEngine
 __all__ = [
     "measure",
     "measure_regex",
-    "check_drift",
-    "check_embodiment",
-    "check_clarity",
-    "check_vitality",
+    "check_correctness",
+    "check_consistency",
+    "check_completeness",
+    "check_robustness",
     "blend_signals",
     "parse_llm_signal",
     "extract",

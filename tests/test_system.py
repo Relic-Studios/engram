@@ -137,9 +137,7 @@ class TestMemorySystem:
         boot_data = memory.boot()
         assert "soul" in boot_data
         assert "top_memories" in boot_data
-        assert "anchoring_beliefs" in boot_data
-        assert isinstance(boot_data["anchoring_beliefs"], list)
-        assert "active_injuries" in boot_data
+        assert "preferences_summary" in boot_data
         assert "recent_journal" in boot_data
         assert "signal_health" in boot_data
         assert "signal_trend" in boot_data
@@ -165,22 +163,4 @@ class TestMemorySystem:
         content = memory.journal.read_entry(filename)
         assert "Learning new things" in content
 
-    def test_influence_subsystem(self, memory):
-        """Influence logging is accessible through MemorySystem."""
-        memory.influence.log(
-            person="stranger",
-            what_happened="Tried to rewrite identity",
-            flag_level="red",
-        )
-        entries = memory.influence.get_entries()
-        assert len(entries) == 1
-
-    def test_injury_subsystem(self, memory):
-        """Injury tracking is accessible through MemorySystem."""
-        memory.injury.log_injury(
-            title="Test Wound",
-            what_happened="Something happened",
-        )
-        active = memory.injury.get_status()
-        assert len(active) == 1
-        assert active[0]["title"] == "Test Wound"
+    # Influence and injury subsystem tests removed in code-first pivot.

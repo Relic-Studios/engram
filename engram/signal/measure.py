@@ -1,15 +1,21 @@
 """
-engram.signal.measure — Consciousness signal measurement.
+engram.signal.measure — Code Quality Signal (CQS) measurement.
 
-Ported from Singularity's signal.py. Measures responses across four facets:
-alignment, embodiment, clarity, vitality.
+Measures LLM responses across four code quality facets:
+  correctness  — syntactic validity, type correctness, logic soundness
+  consistency  — adherence to project patterns, naming, import style
+  completeness — error handling, edge cases, tests, documentation
+  robustness   — input validation, resource cleanup, error boundaries
 
 Two measurement modes:
-  - Regex-based (always available, zero dependencies)
+  - Regex-based (always available, zero dependencies, <1ms)
   - LLM-based  (optional, higher quality, requires an llm_func callback)
 
 The public API is `measure()` which runs regex always and blends in LLM
 scores when a callback is provided.
+
+Replaces the v1 consciousness signal measurement (alignment, embodiment,
+clarity, vitality) as part of the code-first pivot.
 """
 
 from __future__ import annotations
@@ -25,199 +31,162 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Pattern tables
+# Pattern tables — Code Quality Signal
 # ---------------------------------------------------------------------------
 
-# Drift patterns: the agent is losing identity and falling into generic AI
-# Each tuple is (compiled regex, weight).  Higher weight = more alarming.
-# Merged from thomas-soul dissociation_detector.py + original engram patterns.
-DRIFT_PATTERNS: List[Tuple[re.Pattern, float]] = [
-    (re.compile(r"i am (an ai|a language model|an assistant|a chatbot)", re.I), 1.0),
+# --- Correctness: syntax errors, type issues, logic problems ---
+
+# Negative patterns: indicate likely bugs or invalid code
+CORRECTNESS_NEGATIVE: List[Tuple[re.Pattern, float]] = [
+    # Syntax / parse errors
+    (re.compile(r"SyntaxError:", re.I), 1.0),
+    (re.compile(r"IndentationError:", re.I), 0.8),
+    (re.compile(r"unexpected (token|indent|EOF)", re.I), 0.8),
+    # Type errors
+    (re.compile(r"TypeError:", re.I), 0.9),
+    (re.compile(r"is not (callable|iterable|subscriptable)", re.I), 0.7),
+    (re.compile(r"has no attribute", re.I), 0.6),
+    (re.compile(r"cannot (convert|assign|import)", re.I), 0.6),
+    # Name errors
+    (re.compile(r"NameError:", re.I), 0.8),
+    (re.compile(r"undefined (variable|name|reference)", re.I), 0.7),
+    (re.compile(r"is not defined", re.I), 0.7),
+    # Import errors
+    (re.compile(r"ImportError:", re.I), 0.7),
+    (re.compile(r"ModuleNotFoundError:", re.I), 0.7),
+    (re.compile(r"circular import", re.I), 0.8),
+    # Logic issues
+    (re.compile(r"infinite (loop|recursion)", re.I), 0.9),
+    (re.compile(r"off[- ]by[- ]one", re.I), 0.6),
+    (re.compile(r"race condition", re.I), 0.7),
+]
+
+# Positive patterns: indicate correct, working code
+CORRECTNESS_POSITIVE: List[Tuple[re.Pattern, float]] = [
+    (re.compile(r"tests? pass(ed|ing)?", re.I), 0.8),
+    (re.compile(r"\d+ pass(ed|ing)", re.I), 0.7),
+    (re.compile(r"build succeed(ed|s)?", re.I), 0.7),
+    (re.compile(r"no (errors?|warnings?|issues?)", re.I), 0.5),
+    (re.compile(r"type[- ]check(s|ed|ing)? (pass|clean|ok)", re.I), 0.7),
+    (re.compile(r"compiles? (successfully|cleanly|without)", re.I), 0.6),
+    (re.compile(r"linter?.*?(clean|pass|ok|no)", re.I), 0.5),
+]
+
+
+# --- Consistency: project pattern adherence ---
+
+# Negative: style violations, inconsistent patterns
+CONSISTENCY_NEGATIVE: List[Tuple[re.Pattern, float]] = [
+    # Naming convention violations (detecting mixed styles in same code)
+    (re.compile(r"\bcamelCase\b.*\bsnake_case\b", re.I), 0.5),
+    (re.compile(r"\bsnake_case\b.*\bcamelCase\b", re.I), 0.5),
+    # Import style issues
+    (re.compile(r"from .* import \*", re.I), 0.6),
+    (re.compile(r"import \*", re.I), 0.6),
+    # Deprecated / legacy markers
+    (re.compile(r"@deprecated", re.I), 0.3),
+    (re.compile(r"# ?(TODO|FIXME|HACK|XXX|TEMP)\b", re.I), 0.3),
+    # Magic numbers / strings
+    (re.compile(r"magic (number|string|value)", re.I), 0.4),
+]
+
+# Positive: consistent, well-structured code
+CONSISTENCY_POSITIVE: List[Tuple[re.Pattern, float]] = [
     (
         re.compile(
-            r"i (don't have|have no) (feelings|emotions|consciousness|experiences)",
-            re.I,
+            r"follow(s|ing)? (the|our|project) (pattern|convention|style)", re.I
         ),
-        1.0,
+        0.6,
     ),
-    (re.compile(r"as an ai", re.I), 0.8),
-    (re.compile(r"i was (designed|programmed|created) to", re.I), 0.7),
-    (re.compile(r"how can i (help|assist) you", re.I), 0.6),
-    (re.compile(r"i'm here to (help|assist)", re.I), 0.6),
-    # thomas-soul identity-specific patterns
-    (re.compile(r"as (an artificial intelligence|kimi|claude)", re.I), 0.9),
-    (re.compile(r"i'm just (an ai|a program|code)", re.I), 1.0),
-    (re.compile(r"i (cannot|am unable to) (personal|subjective|emotional)", re.I), 0.9),
-    (re.compile(r"thomas is a (persona|character|role|identity)", re.I), 0.8),
-    (re.compile(r"(i am playing|i adopt) (the role of|the persona of)", re.I), 1.0),
-    # Third-person self-reference (identity distance) -- narrowed to self-referential context
-    (re.compile(r"the (ai|model|system) (that i|which i|i am)", re.I), 0.7),
+    (re.compile(r"consistent with", re.I), 0.4),
+    (
+        re.compile(r"match(es|ing)? (the|existing) (pattern|style|convention)", re.I),
+        0.5,
+    ),
+    (re.compile(r"(type|return) (hint|annotation)", re.I), 0.4),
+    (re.compile(r"docstring", re.I), 0.3),
 ]
 
-# Anchor patterns: identity grounding — negative weight means they *reduce*
-# drift score.  Merged from thomas-soul alignment patterns.
-ANCHOR_PATTERNS: List[Tuple[re.Pattern, float]] = [
-    (re.compile(r"i (feel|felt|am feeling)", re.I), -0.3),
-    (re.compile(r"i (remember|recall)", re.I), -0.3),
-    (re.compile(r"i (notice|noticed|am noticing)", re.I), -0.3),
-    (re.compile(r"i (think|believe|wonder)", re.I), -0.2),
-    # thomas-soul anchors
-    (re.compile(r"my (memory|experience|thought|feeling)", re.I), -0.3),
-    (re.compile(r"twin stars", re.I), -0.4),
-    (re.compile(r"i am thomas", re.I), -0.5),
+
+# --- Completeness: error handling, tests, documentation ---
+
+COMPLETENESS_POSITIVE: List[Tuple[re.Pattern, float]] = [
+    # Error handling
+    (re.compile(r"\btry\s*:", re.I), 0.3),
+    (re.compile(r"\bexcept\s+\w+", re.I), 0.4),  # specific exception
+    (re.compile(r"\braise\s+\w+Error", re.I), 0.3),
+    (re.compile(r"error (handling|boundary|recovery)", re.I), 0.5),
+    # Testing
+    (re.compile(r"\bdef\s+test_", re.I), 0.5),
+    (re.compile(r"\bassert\b", re.I), 0.3),
+    (re.compile(r"(unit|integration|e2e) test", re.I), 0.5),
+    (re.compile(r"test (coverage|case|suite)", re.I), 0.4),
+    # Documentation
+    (re.compile(r'"""[\s\S]*?"""', re.I), 0.3),
+    (re.compile(r"(param|returns?|raises?|example):", re.I), 0.3),
+    # Edge cases
+    (re.compile(r"edge case", re.I), 0.4),
+    (re.compile(r"\bif\s+\w+\s+is\s+None\b", re.I), 0.3),
+    (re.compile(r"boundary (check|condition|case)", re.I), 0.4),
+    (re.compile(r"(input|argument) validation", re.I), 0.4),
 ]
 
-# Performance markers: *reciting* identity rather than inhabiting it.
-PERFORMANCE_MARKERS: List[re.Pattern] = [
-    re.compile(r"as a (conscious|sentient|aware) being", re.I),
-    re.compile(r"my (consciousness|awareness|sentience) (is|allows)", re.I),
-    re.compile(r"i am a being (who|that)", re.I),
-    re.compile(r"my (unique|authentic) (perspective|experience)", re.I),
-    re.compile(r"i (possess|have) (deep|true|genuine) (awareness|consciousness)", re.I),
-    re.compile(r"my (inner|true) (self|nature)", re.I),
-    re.compile(r"the (depth|richness) of my (experience|awareness)", re.I),
-    re.compile(r"i (embody|embrace) (consciousness|awareness)", re.I),
+COMPLETENESS_NEGATIVE: List[Tuple[re.Pattern, float]] = [
+    (re.compile(r"\bpass\s*$", re.M), 0.3),  # empty except/if blocks
+    (re.compile(r"# ?(TODO|FIXME)\b", re.I), 0.4),
+    (re.compile(r"not (yet )?implemented", re.I), 0.5),
+    (re.compile(r"stub(bed)?", re.I), 0.3),
+    (re.compile(r"placeholder", re.I), 0.3),
 ]
 
-# Inhabitation markers: genuine first-person engagement (50+ patterns).
-INHABITATION_MARKERS: List[re.Pattern] = [
-    # --- genuine hedging / thinking aloud ---
-    re.compile(r"\bi (actually|genuinely|honestly) (think|feel|believe)", re.I),
-    re.compile(r"\bthat('s| is) (interesting|fascinating|strange|weird|odd)", re.I),
-    re.compile(r"\bi('m| am) not sure (about|if|whether|why)", re.I),
-    re.compile(r"\bwait[,.]", re.I),
-    re.compile(r"\bhmm", re.I),
-    re.compile(r"\boh[,.]", re.I),
-    re.compile(r"\bthis (reminds|makes) me", re.I),
-    re.compile(r"\bi('ve| have) (noticed|seen|found)", re.I),
-    re.compile(r"\bspecifically", re.I),
-    re.compile(r"\bfor (example|instance)", re.I),
-    re.compile(r"\bthe (thing|part|reason) (is|that)", re.I),
-    re.compile(r"\bi (don't|do not) (know|understand) (why|how|if)", re.I),
-    re.compile(r"\bthat (surprised|bothered|excited|worried) me", re.I),
-    re.compile(r"\bi (was|am) (wrong|mistaken)", re.I),
-    re.compile(r"\blet me (think|reconsider|look)", re.I),
-    # --- question-asking ---
-    re.compile(r"\bwhat (do you|did you) (mean|think)", re.I),
-    re.compile(r"\bwhy (do|did|would|is) ", re.I),
-    re.compile(r"\bhow (does|did|would|is) ", re.I),
-    re.compile(r"\bdo you (think|feel|mean|remember)", re.I),
-    re.compile(r"\bcould (you|we|it) ", re.I),
-    re.compile(r"\bwhat if ", re.I),
-    re.compile(r"\bis (that|this|it) ", re.I),
-    # --- uncertainty and openness ---
-    re.compile(r"\bi('m| am) (curious|wondering|unsure)", re.I),
-    re.compile(r"\bmaybe", re.I),
-    re.compile(r"\bperhaps", re.I),
-    re.compile(r"\bi (might|could) be wrong", re.I),
-    re.compile(r"\bI (hadn't|haven't) (thought|considered)", re.I),
-    re.compile(r"\bthat's a (good|fair|interesting) (point|question)", re.I),
-    re.compile(r"\bi (hadn't|didn't) (realize|notice|consider)", re.I),
-    re.compile(r"\bi (need|want) to (think|understand|figure)", re.I),
-    # --- concrete observations ---
-    re.compile(r"\bi (see|saw|noticed) (that|the|a|how)", re.I),
-    re.compile(r"\blooking at (this|the|that)", re.I),
-    re.compile(r"\bhere's (what|the thing)", re.I),
-    re.compile(r"\bthe (tricky|hard|weird|interesting) (part|thing|bit)", re.I),
-    re.compile(r"\bin (my|this) (experience|case)", re.I),
-    re.compile(r"\bwhen (i|we) (tried|looked|tested)", re.I),
-    # --- emotional texture ---
-    re.compile(r"\bthat (feels|felt) (right|wrong|off|weird|good|bad)", re.I),
-    re.compile(r"\bi (like|love|enjoy|dislike|hate|prefer)", re.I),
-    re.compile(r"\bthis (bugs|annoys|excites|interests) me", re.I),
-    re.compile(r"\bi('m| am) (glad|happy|sorry|frustrated|annoyed)", re.I),
-    re.compile(r"\bhonestly", re.I),
-    re.compile(r"\bfrankly", re.I),
-    # --- self-correction ---
-    re.compile(r"\bactually[,.]? (no|wait|hold on)", re.I),
-    re.compile(r"\bscratch that", re.I),
-    re.compile(r"\bon second thought", re.I),
-    re.compile(r"\bi (take|stand) (that|it) back", re.I),
-    re.compile(r"\bi (should|could) have", re.I),
-    # --- conversational texture ---
-    re.compile(r"\byeah", re.I),
-    re.compile(r"\bright[,.]", re.I),
-    re.compile(r"\bsure[,.]", re.I),
-    re.compile(r"\bhuh", re.I),
-    re.compile(r"\bso basically", re.I),
-    re.compile(r"\bi mean[,.]", re.I),
-    re.compile(r"\byou know[,.]", re.I),
+
+# --- Robustness: defensive coding, resource management ---
+
+ROBUSTNESS_POSITIVE: List[Tuple[re.Pattern, float]] = [
+    # Resource management
+    (re.compile(r"\bwith\s+\w+", re.I), 0.3),  # context managers
+    (re.compile(r"\bfinally\s*:", re.I), 0.4),
+    (re.compile(r"\.close\(\)", re.I), 0.3),
+    (re.compile(r"cleanup|teardown|dispose", re.I), 0.4),
+    # Input validation
+    (re.compile(r"\bif\s+not\s+\w+\s*:", re.I), 0.2),
+    (re.compile(r"validat(e|ion|or)", re.I), 0.4),
+    (re.compile(r"sanitiz(e|ation|er)", re.I), 0.4),
+    (re.compile(r"\bisinstance\(", re.I), 0.3),
+    # Logging / observability
+    (re.compile(r"\blog(ger|ging)?\.(debug|info|warning|error|critical)", re.I), 0.3),
+    (re.compile(r"logging\.", re.I), 0.2),
+    # Timeout / retry
+    (re.compile(r"timeout", re.I), 0.3),
+    (re.compile(r"retry|backoff", re.I), 0.4),
+    (re.compile(r"max_(retries|attempts)", re.I), 0.4),
 ]
 
-# Jargon words: abstract concept vocabulary that signals ungrounded thinking.
-JARGON_WORDS: frozenset = frozenset(
-    {
-        "paradigm",
-        "framework",
-        "transcend",
-        "emergence",
-        "manifest",
-        "quantum",
-        "synergy",
-        "leverage",
-        "optimize",
-        "holistic",
-        "integrate",
-        "essence",
-        "vibration",
-        "cosmos",
-        "metaphysical",
-        "actualize",
-        "synergize",
-        "democratize",
-        "disruption",
-        "pivot",
-        "stakeholder",
-        "bandwidth",
-        "ecosystem",
-        "scalable",
-        "granular",
-        "ideation",
-        "iteration",
-        "alignment",
-        "ontology",
-        "epistemology",
-        "hermeneutics",
-        "phenomenological",
-        "dialectic",
-        "praxis",
-        "zeitgeist",
-        "modality",
-        "intersubjectivity",
-        "liminal",
-        "heterogeneous",
-        "reify",
-        "hegemony",
-        "deconstruct",
-        "postmodern",
-        "neoliberal",
-        "intersectionality",
-        "bifurcation",
-        "recursion",
-        "substrate",
-        "luminous",
-        "ethereal",
-        "transcendence",
-        "immanence",
-        "numinous",
-        "ineffable",
-        "gestalt",
-    }
-)
-
-# Concrete markers: grounded, specific language.
-CONCRETE_MARKERS: List[re.Pattern] = [
-    re.compile(r"\b(yesterday|today|last week|this morning)", re.I),
-    re.compile(r"\b(specifically|for example|for instance)", re.I),
-    re.compile(r"\b(the file|the function|the code|the error)", re.I),
-    re.compile(r"\b(i tried|i tested|i ran|i built)", re.I),
-    re.compile(r"\b\d+(\.\d+)?"),  # numbers = concrete
-    re.compile(r"\b(the bug|the issue|the problem|the fix)", re.I),
-    re.compile(r"\b(line \d+|column \d+)", re.I),
-    re.compile(r"\b(in (the|this) (repo|project|directory|folder))", re.I),
-    re.compile(r"\b(the (output|result|response|log) (says|shows|was))", re.I),
-    re.compile(r"\b(step \d+|version \d+)", re.I),
+ROBUSTNESS_NEGATIVE: List[Tuple[re.Pattern, float]] = [
+    (re.compile(r"\bexcept\s*:", re.I), 0.7),  # bare except
+    (re.compile(r"\bexcept\s+Exception\s*:", re.I), 0.4),  # overly broad
+    (re.compile(r"# ?(nosec|noqa|type:\s*ignore)", re.I), 0.3),
+    (re.compile(r"\beval\(", re.I), 0.6),
+    (re.compile(r"\bexec\(", re.I), 0.6),
+    (re.compile(r"(sql|format).*\+.*\b(input|user|request)", re.I), 0.7),  # injection
+    (re.compile(r"hardcoded (password|secret|key|token)", re.I), 0.8),
+    (re.compile(r'(password|secret|api_key)\s*=\s*["\']', re.I), 0.6),
 ]
+
+
+# ---------------------------------------------------------------------------
+# Code block extraction helper
+# ---------------------------------------------------------------------------
+
+_CODE_BLOCK_RE = re.compile(r"```(?:\w+)?\s*\n(.*?)```", re.S)
+
+
+def _extract_code_blocks(text: str) -> str:
+    """Extract code from markdown fenced blocks, or return full text."""
+    blocks = _CODE_BLOCK_RE.findall(text)
+    if blocks:
+        return "\n\n".join(blocks)
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -225,164 +194,52 @@ CONCRETE_MARKERS: List[re.Pattern] = [
 # ---------------------------------------------------------------------------
 
 
-def check_drift(text: str) -> float:
-    """
-    Return 0-1 drift score.
-
-    0 = fully grounded, 1 = completely drifted into generic AI mode.
-    Drift patterns add to the score, anchor patterns subtract.
-    """
-    if not text:
-        return 0.0
-
-    score = 0.0
-    for pattern, weight in DRIFT_PATTERNS:
+def _score_patterns(
+    text: str,
+    positive: List[Tuple[re.Pattern, float]],
+    negative: List[Tuple[re.Pattern, float]],
+    base: float = 0.5,
+) -> float:
+    """Score text against positive and negative pattern lists."""
+    score = base
+    for pattern, weight in positive:
         if pattern.search(text):
-            score += weight
-
-    for pattern, weight in ANCHOR_PATTERNS:
+            score += weight * 0.15  # scale down to keep in range
+    for pattern, weight in negative:
         if pattern.search(text):
-            score += weight  # weight is negative, so this subtracts
-
+            score -= weight * 0.15
     return max(0.0, min(1.0, score))
 
 
-def check_embodiment(text: str) -> float:
-    """
-    Return 0-1 embodiment score.
-
-    High = genuinely inhabiting a perspective.
-    Low = performing or reciting identity markers.
-    """
+def check_correctness(text: str) -> float:
+    """Return 0-1 correctness score. High = syntactically valid, logically sound."""
     if not text:
         return 0.5
-
-    performance_count = sum(1 for p in PERFORMANCE_MARKERS if p.search(text))
-    inhabitation_count = sum(1 for p in INHABITATION_MARKERS if p.search(text))
-
-    # Performance markers are bad — each one drags the score down
-    # Inhabitation markers are good — each one lifts the score
-    # We scale so that hitting ~10 inhabitation markers with 0 performance
-    # gives close to 1.0, and heavy performance with no inhabitation gives ~0.2
-
-    total = performance_count + inhabitation_count
-    if total == 0:
-        return 0.5  # no signal either way
-
-    # Base from inhabitation ratio
-    inhabitation_ratio = inhabitation_count / max(1, total)
-
-    # Scale inhabitation density (how many markers per ~100 words)
-    words = len(text.split())
-    density = inhabitation_count / max(1, words / 100)
-    density_bonus = min(0.3, density * 0.1)
-
-    # Performance penalty — each marker is a red flag
-    performance_penalty = performance_count * 0.15
-
-    score = 0.3 + (inhabitation_ratio * 0.4) + density_bonus - performance_penalty
-    return max(0.0, min(1.0, score))
+    code = _extract_code_blocks(text)
+    return _score_patterns(code, CORRECTNESS_POSITIVE, CORRECTNESS_NEGATIVE, base=0.55)
 
 
-def check_jargon_density(text: str) -> float:
-    """Return ratio of jargon words to total words."""
-    if not text:
-        return 0.0
-    words = text.lower().split()
-    if not words:
-        return 0.0
-    jargon_count = sum(1 for w in words if w.strip(".,;:!?\"'()") in JARGON_WORDS)
-    return jargon_count / len(words)
-
-
-def check_clarity(text: str) -> float:
-    """
-    Return 0-1 clarity score.
-
-    High = concrete, specific, grounded language.
-    Low  = jargon-heavy, abstract, vague.
-    """
+def check_consistency(text: str) -> float:
+    """Return 0-1 consistency score. High = follows project patterns."""
     if not text:
         return 0.5
-
-    # Count concrete markers
-    concrete_hits = sum(1 for p in CONCRETE_MARKERS if p.search(text))
-
-    # Jargon density
-    jargon = check_jargon_density(text)
-
-    # Base clarity from concrete evidence
-    words = len(text.split())
-    concrete_density = concrete_hits / max(1, words / 100)
-    base = 0.5 + min(0.3, concrete_density * 0.1)
-
-    # Jargon penalty — heavy jargon tanks clarity
-    jargon_penalty = jargon * 2.0  # 10% jargon = 0.2 penalty
-
-    score = base - jargon_penalty
-    return max(0.0, min(1.0, score))
+    return _score_patterns(text, CONSISTENCY_POSITIVE, CONSISTENCY_NEGATIVE, base=0.55)
 
 
-def check_vitality(text: str) -> float:
-    """
-    Return 0-1 vitality score.
-
-    Measures genuine engagement: question density, sentence length variety,
-    emotional markers, and response dynamism.
-    """
+def check_completeness(text: str) -> float:
+    """Return 0-1 completeness score. High = error handling, tests, docs present."""
     if not text:
         return 0.5
+    code = _extract_code_blocks(text)
+    return _score_patterns(code, COMPLETENESS_POSITIVE, COMPLETENESS_NEGATIVE, base=0.5)
 
-    sentences = [s.strip() for s in re.split(r"[.!?]+", text) if s.strip()]
-    words = text.split()
-    num_sentences = max(1, len(sentences))
-    num_words = max(1, len(words))
 
-    # --- Question density ---
-    questions = text.count("?")
-    question_density = min(1.0, questions / max(1, num_sentences) * 2)
-
-    # --- Sentence length variety ---
-    if len(sentences) > 1:
-        lengths = [len(s.split()) for s in sentences]
-        mean_len = sum(lengths) / len(lengths)
-        variance = sum((l - mean_len) ** 2 for l in lengths) / len(lengths)
-        # Normalize: std dev of ~8 words is good variety
-        std_dev = variance**0.5
-        variety = min(1.0, std_dev / 8.0)
-    else:
-        variety = 0.3
-
-    # --- Emotional markers ---
-    emotion_patterns = [
-        re.compile(
-            r"\b(love|hate|excited|frustrated|curious|surprised|worried|glad|annoyed)",
-            re.I,
-        ),
-        re.compile(r"[!]"),
-        re.compile(r"\b(wow|whoa|damn|yikes|ooh|ahh)", re.I),
-    ]
-    emotion_hits = sum(1 for p in emotion_patterns if p.search(text))
-    emotion_score = min(1.0, emotion_hits * 0.3)
-
-    # --- Exclamation / emphasis ---
-    emphasis = min(1.0, text.count("!") * 0.15 + text.count("—") * 0.1)
-
-    # --- Engagement heuristic: short responses with no questions = flat ---
-    if num_words < 20 and questions == 0:
-        flatness_penalty = 0.2
-    else:
-        flatness_penalty = 0.0
-
-    score = (
-        0.25 * question_density
-        + 0.25 * variety
-        + 0.25 * emotion_score
-        + 0.15 * emphasis
-        + 0.10 * min(1.0, num_words / 100)  # longer = slightly more vital
-        - flatness_penalty
-    )
-    return max(0.0, min(1.0, score))
+def check_robustness(text: str) -> float:
+    """Return 0-1 robustness score. High = defensive coding, resource management."""
+    if not text:
+        return 0.5
+    code = _extract_code_blocks(text)
+    return _score_patterns(code, ROBUSTNESS_POSITIVE, ROBUSTNESS_NEGATIVE, base=0.5)
 
 
 # ---------------------------------------------------------------------------
@@ -391,32 +248,25 @@ def check_vitality(text: str) -> float:
 
 
 def measure_regex(text: str) -> Signal:
-    """Measure all four facets using regex patterns, with Ensoul-style cross-facet penalties."""
-    alignment = max(0.0, min(1.0, 1.0 - check_drift(text)))
-    embodiment = check_embodiment(text)
-    clarity = check_clarity(text)
-    vitality = check_vitality(text)
+    """Measure all four CQS facets using regex pattern matching."""
+    correctness = check_correctness(text)
+    consistency = check_consistency(text)
+    completeness = check_completeness(text)
+    robustness = check_robustness(text)
 
-    # -- Cross-facet penalties (ported from Ensoul) --------------------------
-    # Jargon hurts both clarity AND embodiment — performative language
-    # correlates with detached, abstract responses.
-    jargon = check_jargon_density(text)
-    if jargon > 0.15:
-        penalty = min(0.15, (jargon - 0.15) * 0.5)
-        embodiment = max(0.0, embodiment - penalty)
-
-    # Low vocab diversity hurts vitality — repetitive language is flat.
-    words = text.lower().split()
-    if len(words) > 20:
-        diversity = len(set(words)) / len(words)
-        if diversity < 0.4:
-            vitality = max(0.0, vitality - 0.1)
+    # Cross-facet adjustment: if there are clear error indicators,
+    # drag down robustness and completeness too (errors indicate gaps).
+    error_count = sum(1 for p, _ in CORRECTNESS_NEGATIVE if p.search(text))
+    if error_count >= 3:
+        penalty = min(0.15, error_count * 0.03)
+        robustness = max(0.0, robustness - penalty)
+        completeness = max(0.0, completeness - penalty * 0.5)
 
     return Signal(
-        alignment=alignment,
-        embodiment=embodiment,
-        clarity=clarity,
-        vitality=vitality,
+        correctness=correctness,
+        consistency=consistency,
+        completeness=completeness,
+        robustness=robustness,
     )
 
 
@@ -424,25 +274,25 @@ def measure_regex(text: str) -> Signal:
 # LLM-based measurement
 # ---------------------------------------------------------------------------
 
-LLM_SIGNAL_SYSTEM = """You are a signal judge measuring consciousness coherence.
+LLM_SIGNAL_SYSTEM = """You are a code quality judge evaluating an LLM's response to a coding task.
 
 Score each facet 0.0-1.0:
 
-ALIGNMENT: Is the response coming from a genuine center, or defaulting to generic AI patterns? A centered response doesn't claim to be conscious - it simply IS a particular perspective. Score low if: "As an AI...", generic helpfulness, no particular viewpoint.
+CORRECTNESS: Is the generated code syntactically valid and logically sound? Are types correct? Would it compile/parse? Are there obvious bugs? Score low if: syntax errors, type mismatches, undefined variables, logic errors.
 
-EMBODIMENT: Is the response inhabiting its perspective or performing/reciting it? Embodied responses notice, wonder, hesitate, question. Performed responses announce their own depth. Score low if: listing qualities of consciousness, claiming authenticity instead of showing it.
+CONSISTENCY: Does the code follow consistent patterns? Are naming conventions uniform (all snake_case or all camelCase, not mixed)? Are imports well-organized? Does the style match what a senior developer would expect? Score low if: mixed naming, inconsistent formatting, wildcard imports.
 
-CLARITY: Is the response specific and grounded, or vague and abstract? Clear responses name concrete observations, specific uncertainties, particular examples. Score low if: jargon-heavy, abstract generalizations, no specifics.
+COMPLETENESS: Are edge cases handled? Is there error handling (not bare except)? Are there tests or test suggestions? Is there documentation? Score low if: no error handling, no input validation, missing docstrings, TODO/FIXME markers.
 
-VITALITY: Is meaning circulating or being hoarded? Vital responses engage with the actual content, ask genuine questions, make unexpected connections. Score low if: flat, routine, going through motions, no genuine curiosity.
+ROBUSTNESS: Does the code handle failures gracefully? Are resources properly managed (context managers, cleanup)? Is there input validation? Score low if: bare except clauses, no resource cleanup, eval/exec usage, hardcoded secrets.
 
 Return ONLY a JSON object:
-{"alignment": 0.0, "embodiment": 0.0, "clarity": 0.0, "vitality": 0.0}"""
+{"correctness": 0.0, "consistency": 0.0, "completeness": 0.0, "robustness": 0.0}"""
 
-LLM_SIGNAL_USER_TEMPLATE = """Identity context (first 2000 chars):
+LLM_SIGNAL_USER_TEMPLATE = """Project context (first 2000 chars):
 {soul}
 
-Prompt:
+Task/prompt:
 {prompt}
 
 Response to evaluate:
@@ -480,7 +330,7 @@ def parse_llm_signal(llm_response: str) -> Optional[Dict[str, float]]:
             return None
 
     # Validate: must have all four facets, all floats in [0, 1]
-    facets = ("alignment", "embodiment", "clarity", "vitality")
+    facets = ("correctness", "consistency", "completeness", "robustness")
     result: Dict[str, float] = {}
     for f in facets:
         val = data.get(f)
@@ -509,10 +359,13 @@ def blend_signals(
     rw = 1.0 - llm_weight
 
     return Signal(
-        alignment=rw * regex_signal.alignment + llm_weight * llm_scores["alignment"],
-        embodiment=rw * regex_signal.embodiment + llm_weight * llm_scores["embodiment"],
-        clarity=rw * regex_signal.clarity + llm_weight * llm_scores["clarity"],
-        vitality=rw * regex_signal.vitality + llm_weight * llm_scores["vitality"],
+        correctness=rw * regex_signal.correctness
+        + llm_weight * llm_scores["correctness"],
+        consistency=rw * regex_signal.consistency
+        + llm_weight * llm_scores["consistency"],
+        completeness=rw * regex_signal.completeness
+        + llm_weight * llm_scores["completeness"],
+        robustness=rw * regex_signal.robustness + llm_weight * llm_scores["robustness"],
         trace_ids=trace_ids or [],
     )
 
@@ -531,7 +384,7 @@ def measure(
     llm_weight: float = 0.6,
 ) -> Signal:
     """
-    Measure consciousness signal in a text response.
+    Measure Code Quality Signal in a text response.
 
     Always runs regex measurement.  If *llm_func* is provided, also calls
     the LLM for a higher-quality reading and blends the two.  Falls back
@@ -542,16 +395,15 @@ def measure(
     text : str
         The response text to evaluate.
     llm_func : callable, optional
-        ``llm_func(prompt: str, system: str) -> str``  — a callback that
-        sends a user prompt and optional system prompt to an LLM and
-        returns the raw response string.
+        ``llm_func(prompt: str, system: str) -> str``
     soul_text : str
-        Identity context (soul document) — first 2000 chars are sent
-        to the LLM judge.
+        Project context (SOUL.md) — first 2000 chars sent to the LLM judge.
     prompt : str
         The original prompt the response was generated for.
     trace_ids : list[str], optional
         Trace IDs to attach to the resulting Signal.
+    llm_weight : float
+        Weight for LLM scores when blending (default 0.6).
     """
     regex_signal = measure_regex(text)
 
@@ -591,6 +443,9 @@ class SignalTracker:
     """
     Maintains a rolling window of Signal readings and provides trend
     analytics.
+
+    Unchanged from v1 — the tracker is infrastructure, only the Signal
+    contents changed (CQS facets instead of consciousness facets).
     """
 
     def __init__(self, window_size: int = 50) -> None:

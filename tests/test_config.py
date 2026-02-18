@@ -11,7 +11,7 @@ class TestConfig:
         assert c.signal_mode == "hybrid"
         assert c.extract_mode == "off"
         assert c.llm_provider == "ollama"
-        assert c.token_budget == 6000
+        assert c.token_budget == 12000
 
     def test_from_data_dir(self, tmp_path):
         c = Config.from_data_dir(tmp_path)

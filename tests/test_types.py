@@ -87,35 +87,35 @@ class TestSignal:
     def test_defaults(self):
         s = Signal()
         assert s.health == 0.5
-        assert s.state == "developing"
+        assert s.state == "acceptable"
         assert not s.needs_correction
 
-    def test_coherent(self):
-        s = Signal(alignment=0.9, embodiment=0.8, clarity=0.85, vitality=0.9)
-        assert s.state == "coherent"
+    def test_excellent(self):
+        s = Signal(correctness=0.9, consistency=0.8, completeness=0.85, robustness=0.9)
+        assert s.state == "excellent"
         assert s.health >= 0.75
 
-    def test_dissociated(self):
-        s = Signal(alignment=0.1, embodiment=0.2, clarity=0.1, vitality=0.2)
-        assert s.state == "dissociated"
+    def test_poor(self):
+        s = Signal(correctness=0.1, consistency=0.2, completeness=0.1, robustness=0.2)
+        assert s.state == "poor"
         assert s.needs_correction
 
     def test_polarity_gap(self):
-        s = Signal(alignment=0.9, embodiment=0.1, clarity=0.5, vitality=0.5)
+        s = Signal(correctness=0.9, consistency=0.1, completeness=0.5, robustness=0.5)
         assert s.polarity_gap == pytest.approx(0.8)
-        assert s.weakest_facet == "embodiment"
-        assert s.strongest_facet == "alignment"
+        assert s.weakest_facet == "consistency"
+        assert s.strongest_facet == "correctness"
 
     def test_clamping(self):
-        s = Signal(alignment=2.0, embodiment=-1.0)
-        assert s.alignment == 1.0
-        assert s.embodiment == 0.0
+        s = Signal(correctness=2.0, consistency=-1.0)
+        assert s.correctness == 1.0
+        assert s.consistency == 0.0
 
     def test_roundtrip(self):
-        s = Signal(alignment=0.7, trace_ids=["abc"])
+        s = Signal(correctness=0.7, trace_ids=["abc"])
         d = s.to_dict()
         s2 = Signal.from_dict(d)
-        assert s2.alignment == pytest.approx(0.7)
+        assert s2.correctness == pytest.approx(0.7)
         assert s2.trace_ids == ["abc"]
 
 

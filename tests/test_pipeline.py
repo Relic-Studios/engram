@@ -115,7 +115,9 @@ class TestBeforePipeline:
 
         for _ in range(5):
             tracker.record(
-                Signal(alignment=0.1, embodiment=0.2, clarity=0.1, vitality=0.2)
+                Signal(
+                    correctness=0.1, consistency=0.2, completeness=0.1, robustness=0.2
+                )
             )
 
         ctx = before(
