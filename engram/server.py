@@ -14,7 +14,7 @@ Or configure in your MCP client (OpenCode, OpenClaw, etc.) as:
         }
     }
 
-Tools exposed (33 total):
+Tools exposed (35 total):
     Core Pipeline:
         engram_before        -- Pre-LLM context injection
         engram_after         -- Post-LLM logging + learning
@@ -69,6 +69,12 @@ from typing import Any, Optional
 from mcp.server.fastmcp import FastMCP
 
 from engram.core.config import Config
+from engram.core.sessions import (
+    ClientSession,
+    SessionRegistry,
+    get_current_session_id,
+    set_current_session_id,
+)
 from engram.system import MemorySystem
 from engram.working.allocator import reorder_u
 
@@ -145,8 +151,16 @@ mcp = FastMCP(
 # Tools reference it via _get_system().
 _system: Optional[MemorySystem] = None
 
-# Current source/person/project set by engram_before() for scoping
-# across subsequent tool calls within the same conversation turn.
+# Session registry: tracks per-client state for multi-agent support.
+# In stdio mode (single client), only the default session is used.
+# In HTTP/SSE mode, each transport session gets its own ClientSession.
+_sessions = SessionRegistry()
+
+# Legacy globals — kept for backward compatibility with tests that
+# directly set server_mod._current_source = "direct" etc.
+# In production, tools use _get_session() which reads from the
+# session registry.  These globals are synced in engram_before()
+# and engram_project_init() as a fallback.
 _current_source: str = "direct"
 _current_person: str = ""
 _current_project: str = ""
@@ -179,6 +193,17 @@ def _get_system() -> MemorySystem:
     if _system is None:
         _system = init_system()
     return _system
+
+
+def _get_session() -> ClientSession:
+    """Get the ClientSession for the current execution context.
+
+    Uses the contextvars-based session ID to look up the active
+    session in the registry.  In stdio mode this always returns
+    the default session.  In HTTP/SSE mode, the session ID is set
+    per-request by the transport layer.
+    """
+    return _sessions.get(get_current_session_id())
 
 
 def _gate_tool(tool_name: str) -> None:
@@ -220,9 +245,13 @@ def engram_before(
     _validate_length(message, "message")
     system = _get_system()
 
-    # Track source/person for trust gating of subsequent tool calls
+    # Track source/person in both the session registry and legacy globals
+    resolved_person = system.identity.resolve(person)
+    session = _get_session()
+    session.source = source
+    session.person = resolved_person
     _current_source = source
-    _current_person = system.identity.resolve(person)
+    _current_person = resolved_person
 
     ctx = system.before(
         person=person,
@@ -1587,6 +1616,9 @@ def engram_project_init(
     global _current_project
     system = _get_system()
 
+    # Track project in both session registry and legacy global
+    session = _get_session()
+    session.project = project_name
     _current_project = project_name
 
     # Store project context as a high-salience trace
@@ -1696,7 +1728,7 @@ def engram_extract_symbols(
             kind="code_symbols",
             tags=tags,
             salience=0.6,
-            project=_current_project,
+            project=_get_session().project,
             file_path=file_path,
             language=analysis.language,
             fingerprint=analysis.fingerprint,
@@ -1788,14 +1820,15 @@ def engram_repo_map(
 
     # Store as project context trace
     system = _get_system()
-    project_name = _current_project or os.path.basename(directory)
+    current_project = _get_session().project
+    project_name = current_project or os.path.basename(directory)
 
     trace_id = system.episodic.log_trace(
         content=f"# Repo Map: {project_name}\n\n{repo_map}",
         kind="project_context",
         tags=["repo_map", "ast", project_name],
         salience=0.8,
-        project=_current_project,
+        project=current_project,
         directory=directory,
         file_count=file_count,
         symbol_count=index.symbol_count,
@@ -1854,15 +1887,74 @@ def engram_reindex() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Multi-Agent Session Tools
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+@_safe_json
+def engram_sessions() -> str:
+    """List all active client sessions.
+
+    Returns diagnostic information about connected MCP clients,
+    including session IDs, client names, active person/project,
+    and session age.  Useful for debugging multi-agent setups.
+    """
+    sessions = _sessions.list_sessions()
+    return json.dumps(
+        {"active_sessions": sessions, "count": len(sessions)},
+        indent=2,
+        default=str,
+    )
+
+
+@mcp.tool()
+@_safe_json
+def engram_register_client(
+    client_name: str = "",
+    client_version: str = "",
+    session_id: str = "",
+) -> str:
+    """Register or identify an MCP client session.
+
+    Call this at the start of a multi-agent session to associate
+    a human-readable client name with the current session.  Not
+    required for single-client (stdio) mode.
+
+    Args:
+        client_name: Human-readable client name (e.g., "cursor", "claude-code").
+        client_version: Client version string.
+        session_id: Explicit session ID (auto-generated if empty).
+    """
+    import uuid
+
+    sid = session_id or str(uuid.uuid4())[:8]
+    set_current_session_id(sid)
+    session = _get_session()
+    session.client_name = client_name
+    session.client_version = client_version
+    log.info(
+        "Registered client: %s v%s (session=%s)",
+        client_name,
+        client_version,
+        sid,
+    )
+    return json.dumps(session.to_dict(), indent=2, default=str)
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
 
 def _shutdown() -> None:
-    """Clean up the global MemorySystem on process exit."""
+    """Clean up the global MemorySystem and session registry on exit."""
     global _system
     if _system is not None:
         log.info("Shutting down Engram memory system...")
+        active = _sessions.count()
+        if active > 1:
+            log.info("Closing %d active client sessions", active)
         try:
             _system.close()
         except Exception as exc:
@@ -1874,11 +1966,39 @@ def run_server(
     data_dir: Optional[str] = None,
     config_path: Optional[str] = None,
     transport: str = "stdio",
+    host: str = "0.0.0.0",
+    port: int = 8765,
 ) -> None:
-    """Initialize and run the MCP server."""
+    """Initialize and run the MCP server.
+
+    Transports:
+        stdio (default):
+            Single-client mode.  Each IDE spawns its own Engram
+            process.  Client sessions are isolated at the OS level.
+        streamable-http:
+            Multi-client HTTP mode.  Multiple IDEs connect to a
+            single Engram server.  Each client gets its own session
+            via ``engram_register_client()`` or automatic session
+            management by the MCP transport layer.
+        sse:
+            Legacy Server-Sent Events mode.  Similar to streamable-http
+            but uses SSE for the server→client channel.
+
+    Args:
+        data_dir: Path to the Engram data directory.
+        config_path: Path to YAML config file.
+        transport: MCP transport: "stdio", "streamable-http", or "sse".
+        host: Bind address for HTTP transports (default: 0.0.0.0).
+        port: Port for HTTP transports (default: 8765).
+    """
     system = init_system(data_dir=data_dir, config_path=config_path)
     atexit.register(_shutdown)
-    log.info("Starting Engram MCP server (transport=%s)", transport)
+    log.info(
+        "Starting Engram MCP server (transport=%s, sessions=multi-agent)",
+        transport,
+    )
+    if transport in ("streamable-http", "sse"):
+        log.info("HTTP endpoint: http://%s:%d", host, port)
     try:
         mcp.run(transport=transport)  # type: ignore[arg-type]
     finally:

@@ -3,7 +3,7 @@ engram.__main__ -- CLI entry point.
 
 Usage:
     engram init [--data-dir DIR]
-    engram serve [--data-dir DIR] [--config PATH] [--transport stdio|sse]
+    engram serve [--data-dir DIR] [--config PATH] [--transport stdio|sse|streamable-http]
     engram stats [--data-dir DIR]
     engram search QUERY [--person NAME] [--limit N]
     engram reindex [--data-dir DIR]
@@ -49,8 +49,19 @@ def main(argv: list[str] | None = None) -> None:
     serve_p.add_argument(
         "--transport",
         default="stdio",
-        choices=["stdio", "sse"],
-        help="MCP transport (default: stdio)",
+        choices=["stdio", "sse", "streamable-http"],
+        help="MCP transport (default: stdio). Use streamable-http for multi-agent.",
+    )
+    serve_p.add_argument(
+        "--host",
+        default="0.0.0.0",
+        help="Bind address for HTTP transports (default: 0.0.0.0)",
+    )
+    serve_p.add_argument(
+        "--port",
+        type=int,
+        default=8765,
+        help="Port for HTTP transports (default: 8765)",
     )
 
     # -- stats -------------------------------------------------------------
@@ -193,6 +204,8 @@ def _cmd_serve(args: argparse.Namespace) -> None:
         data_dir=args.data_dir,
         config_path=args.config,
         transport=args.transport,
+        host=getattr(args, "host", "0.0.0.0"),
+        port=getattr(args, "port", 8765),
     )
 
 

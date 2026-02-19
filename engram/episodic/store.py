@@ -8,6 +8,7 @@ Every interaction leaves a trace. Salience determines what survives.
 import sqlite3
 import json
 import math
+import threading
 import uuid
 from pathlib import Path
 from typing import Any, Callable, List, Optional, Dict
@@ -22,16 +23,78 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+class _ThreadSafeConn:
+    """Thin wrapper that serializes all SQLite operations via a lock.
+
+    SQLite connections with ``check_same_thread=False`` allow
+    cross-thread use but are NOT thread-safe for concurrent
+    operations.  This wrapper ensures that execute/commit/cursor
+    calls are serialized so multiple MCP clients sharing one
+    Engram server don't trigger ``InterfaceError``.
+
+    The lock overhead is negligible (~1 us) compared to SQLite I/O.
+    """
+
+    __slots__ = ("_conn", "_lock")
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+        self._lock = threading.Lock()
+
+    # --- Proxy the most-used methods ---------------------------------
+
+    def execute(self, sql: str, params: Any = ()) -> sqlite3.Cursor:
+        with self._lock:
+            return self._conn.execute(sql, params)
+
+    def executemany(self, sql: str, seq: Any) -> sqlite3.Cursor:
+        with self._lock:
+            return self._conn.executemany(sql, seq)
+
+    def commit(self) -> None:
+        with self._lock:
+            self._conn.commit()
+
+    def cursor(self) -> sqlite3.Cursor:
+        with self._lock:
+            return self._conn.cursor()
+
+    def rollback(self) -> None:
+        with self._lock:
+            self._conn.rollback()
+
+    def close(self) -> None:
+        with self._lock:
+            self._conn.close()
+
+    # --- Passthrough for row_factory (set at init) -------------------
+
+    @property
+    def row_factory(self):  # type: ignore[override]
+        return self._conn.row_factory
+
+    @row_factory.setter
+    def row_factory(self, value):  # type: ignore[override]
+        self._conn.row_factory = value
+
+
 class EpisodicStore:
     """SQLite-based episodic memory: messages, traces, and events."""
 
     def __init__(self, db_path: Path):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(self.db_path))
-        self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA foreign_keys=ON")
+        # check_same_thread=False: allows multi-agent HTTP mode where
+        # requests may arrive on different threads.
+        raw_conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+        raw_conn.row_factory = sqlite3.Row
+        raw_conn.execute("PRAGMA journal_mode=WAL")
+        raw_conn.execute("PRAGMA foreign_keys=ON")
+        # Reduce busy-timeout contention for concurrent clients
+        raw_conn.execute("PRAGMA busy_timeout=5000")
+        # Wrap in thread-safe proxy so concurrent MCP clients don't
+        # trigger InterfaceError on the same connection.
+        self.conn = _ThreadSafeConn(raw_conn)  # type: ignore[assignment]
         self._create_tables()
 
         # Callback fired after every log_trace().  Signature:
