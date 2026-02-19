@@ -273,6 +273,35 @@ def after(
                 log.warning("Parallel extraction failed: %s", exc)
             timings["extraction"] = time.perf_counter() - _t0
 
+        # -- 6b. Frequency-based skill reinforcement (C2) -----------------
+        #    If the response matches existing procedural skills, reinforce
+        #    them based on CQS health: high health → accept (confidence up),
+        #    low health → reject (confidence down), dead band → no change.
+        _t0 = time.perf_counter()
+        try:
+            skill_reinforcements = procedural.reinforce_matched(
+                response=response,
+                signal_health=signal.health,
+            )
+            for sr in skill_reinforcements:
+                updates.append(
+                    {
+                        "type": "skill_reinforcement",
+                        "skill": sr["name"],
+                        "accepted": sr["accepted"],
+                        "confidence": sr["confidence"],
+                    }
+                )
+                log.debug(
+                    "Skill %s: %s (confidence=%.3f)",
+                    "reinforced" if sr["accepted"] else "penalized",
+                    sr["name"],
+                    sr["confidence"],
+                )
+        except Exception as exc:
+            log.debug("Skill reinforcement failed: %s", exc)
+        timings["skill_reinforcement"] = time.perf_counter() - _t0
+
         # -- 7. Pressure-aware decay + compaction (MemGPT-inspired) --------
         _t0 = time.perf_counter()
         _run_maintenance(
@@ -679,15 +708,29 @@ def _extract_and_apply(
         except Exception as exc:
             log.warning("Failed to process trust change: %s", exc)
 
-    # -- Apply skills learned ----------------------------------------------
+    # -- Apply skills learned (uses structured frontmatter — C1/C2) --------
     for update in extraction.get("skills_learned", []):
         try:
             skill_name = update.get("skill", "")
             content = update.get("content", "")
             if skill_name and content:
-                procedural.add_skill(skill_name, content)
+                # Extract metadata hints from the LLM extraction if present
+                lang = update.get("language", "")
+                framework = update.get("framework", "")
+                category = update.get("category", "")
+                tags = update.get("tags", [])
+                if isinstance(tags, str):
+                    tags = [t.strip() for t in tags.split(",") if t.strip()]
+                procedural.add_structured_skill(
+                    name=skill_name,
+                    content=content,
+                    language=lang,
+                    framework=framework,
+                    category=category,
+                    tags=tags,
+                )
                 updates.append({"type": "skill", "skill": skill_name})
-                log.debug("Added skill: %s", skill_name)
+                log.debug("Added structured skill: %s", skill_name)
         except Exception as exc:
             log.warning("Failed to add skill: %s", exc)
 

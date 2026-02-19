@@ -196,6 +196,119 @@ class ProceduralStore:
         path.write_text(full_content, encoding="utf-8")
         return meta
 
+    # ------------------------------------------------------------------
+    # Frequency-based reinforcement (C2)
+    # ------------------------------------------------------------------
+
+    #: CQS health threshold above which skills are reinforced (accepted).
+    REINFORCE_THRESHOLD: float = 0.7
+
+    #: CQS health threshold below which skills are penalized (rejected).
+    WEAKEN_THRESHOLD: float = 0.4
+
+    #: Minimum confidence for Core Skill promotion.
+    PROMOTION_CONFIDENCE: float = 0.85
+
+    #: Minimum accepted_count for Core Skill promotion.
+    PROMOTION_MIN_ACCEPTS: int = 5
+
+    def reinforce_matched(
+        self,
+        response: str,
+        signal_health: float,
+    ) -> List[Dict]:
+        """Reinforce skills whose patterns match the response.
+
+        Finds skills whose name, language, or tags appear in the
+        response text.  If ``signal_health`` is high (good code),
+        the matching skills are reinforced (accepted).  If signal is
+        low, they are penalized (rejected).
+
+        This creates a Hebbian feedback loop: patterns that appear
+        in high-quality code gain confidence; patterns in low-quality
+        code lose confidence.
+
+        Parameters
+        ----------
+        response:
+            The LLM response text to match against.
+        signal_health:
+            CQS health score (0-1) from signal measurement.
+
+        Returns
+        -------
+        list[dict]
+            List of ``{name, accepted, confidence}`` for each reinforced skill.
+        """
+        if signal_health < self.WEAKEN_THRESHOLD:
+            accepted = False
+        elif signal_health > self.REINFORCE_THRESHOLD:
+            accepted = True
+        else:
+            return []  # Dead band — no reinforcement
+
+        response_lower = response.lower()
+        reinforced: List[Dict] = []
+
+        for path in self.skills_dir.glob("*.md"):
+            meta, _body = self._parse_file(path)
+            name = meta.name or path.stem
+
+            # Check if this skill matches the response
+            matched = False
+
+            # Match on skill name
+            if name.lower().replace("-", " ") in response_lower:
+                matched = True
+            elif name.lower().replace("_", " ") in response_lower:
+                matched = True
+
+            # Match on tags (4+ chars to avoid false positives)
+            if not matched and meta.tags:
+                for tag in meta.tags:
+                    if len(tag) >= 4 and tag.lower() in response_lower:
+                        matched = True
+                        break
+
+            if matched:
+                updated = self.update_confidence(name, accepted=accepted)
+                if updated:
+                    reinforced.append(
+                        {
+                            "name": name,
+                            "accepted": accepted,
+                            "confidence": updated.confidence,
+                        }
+                    )
+
+        return reinforced
+
+    def get_promotable(
+        self,
+        confidence_threshold: float = 0.0,
+        min_accepted: int = 0,
+    ) -> List[SkillMeta]:
+        """Return skills eligible for Core Skill promotion.
+
+        A skill is promotable when its confidence exceeds the threshold
+        AND it has been accepted at least ``min_accepted`` times.
+
+        Uses class defaults if thresholds are 0.
+        """
+        threshold = confidence_threshold or self.PROMOTION_CONFIDENCE
+        min_acc = min_accepted or self.PROMOTION_MIN_ACCEPTS
+
+        promotable: List[SkillMeta] = []
+        for path in self.skills_dir.glob("*.md"):
+            meta, _body = self._parse_file(path)
+            if not meta.name:
+                meta.name = path.stem
+            if meta.confidence >= threshold and meta.accepted_count >= min_acc:
+                promotable.append(meta)
+
+        promotable.sort(key=lambda m: m.confidence, reverse=True)
+        return promotable
+
     @staticmethod
     def _sanitize_name(name: str) -> str:
         """Normalize a skill name to a safe, lowercase filename stem."""
