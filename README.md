@@ -7,7 +7,7 @@ Engram gives LLM coding agents persistent memory across sessions — what was bu
 [![GitHub](https://img.shields.io/badge/GitHub-Relic--Studios%2Fengram-blue?logo=github)](https://github.com/Relic-Studios/engram)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
-[![Tests](https://img.shields.io/badge/tests-554%20passing-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-603%20passing-brightgreen.svg)]()
 
 > **Branch:** `engram-code` — Code-first pivot from the consciousness-focused `master` branch.
 
@@ -43,13 +43,16 @@ Engram solves this by giving agents a memory system designed specifically for co
 ### Search Pipeline
 
 ```
-Query → FTS5 (symbol-expanded) + ChromaDB (vector) → RRF Merge → Cross-Encoder Rerank → Results
+Query → FTS5 (symbol-expanded) + ChromaDB (NL vectors + code vectors) → RRF Merge → Cross-Encoder Rerank → Results
 ```
 
 - **Lexical**: FTS5 with custom symbol tokenizer — splits `camelCase`, `snake_case`, `PascalCase`, dot paths, kebab-case
-- **Semantic**: ChromaDB with nomic-embed-text (768d, local via Ollama)
-- **Fusion**: Reciprocal Rank Fusion (Cormack et al., 2009)
+- **NL Semantic**: ChromaDB with nomic-embed-text (768d, local via Ollama) — conversations, ADRs, journal
+- **Code Semantic**: ChromaDB with jina-embeddings-v2-base-code (768d, 8k context, via sentence-transformers) — function signatures, stack traces, code patterns
+- **Fusion**: Reciprocal Rank Fusion (Cormack et al., 2009) — merges results from all three sources
 - **Reranking**: cross-encoder/ms-marco-MiniLM-L-12-v2 (~30ms, +15-30% precision)
+
+Code traces are dual-indexed in both NL and code collections. Queries search all spaces simultaneously; results that appear in multiple spaces get boosted by RRF.
 
 ### Code Quality Signal (CQS)
 
@@ -107,10 +110,39 @@ git checkout engram-code
 pip install -e ".[all]"
 ```
 
-For AST extraction with tree-sitter (JavaScript/TypeScript support):
+### Dependencies
+
+**Core** (always installed with `pip install -e .`):
+
+| Package | Version | Purpose |
+|---------|---------|---------|
+| `pyyaml` | >=6.0 | YAML config and semantic store files |
+| `chromadb` | >=0.4.0 | Vector search (semantic embeddings) |
+| `mcp` | >=1.0.0 | Model Context Protocol server |
+| `numpy` | >=1.24.0 | Consolidation clustering, numeric ops |
+
+**Optional** (install individually or use `.[all]` for everything):
+
+| Group | Install | Packages | Purpose |
+|-------|---------|----------|---------|
+| `code-embeddings` | `pip install -e ".[code-embeddings]"` | `sentence-transformers>=3.0.0` | Dual-embedding (code model + cross-encoder reranking) |
+| `ast` | `pip install -e ".[ast]"` | `tree-sitter`, `tree-sitter-python`, `tree-sitter-javascript`, `tree-sitter-typescript` | AST extraction for JS/TS (Python uses stdlib) |
+| `consolidation` | `pip install -e ".[consolidation]"` | `hdbscan>=0.8.33` | Topic-coherent memory clustering |
+| `tokens` | `pip install -e ".[tokens]"` | `tiktoken>=0.5.0` | Accurate OpenAI-style token counting |
+| `ollama` | `pip install -e ".[ollama]"` | `httpx>=0.25.0` | Ollama LLM + embedding provider |
+| `anthropic` | `pip install -e ".[anthropic]"` | `anthropic>=0.30.0` | Anthropic LLM provider |
+| `openai` | `pip install -e ".[openai]"` | `openai>=1.0.0` | OpenAI LLM provider |
+
+**GPU acceleration** (optional):
+
+The code embedding model and cross-encoder reranker use PyTorch. By default PyTorch runs on CPU, which is fine for single-document inference (~50ms). For GPU acceleration on NVIDIA GPUs:
+
 ```bash
-pip install -e ".[ast]"
+# Replace the CPU-only torch with CUDA-enabled version
+pip install torch --index-url https://download.pytorch.org/whl/cu124
 ```
+
+The system auto-detects CUDA availability. No code changes needed.
 
 ### Initialize
 
@@ -286,6 +318,7 @@ Skills + ADRs                                                      |
 | **Conversation compaction** | MemGPT-inspired summarization | Old messages → thread traces |
 | **Project scoping** | Per-project memory isolation | Context doesn't leak across projects |
 | **Style enforcement** | AST + regex style checking in after-pipeline | Naming conventions, nesting depth |
+| **Dual embeddings** | NL model (Ollama) + code model (sentence-transformers) | Separate vector spaces for prose and code |
 | **Symbol tokenization** | Application-layer FTS5 expansion | `getUserName` → `get user name` for search |
 
 ---
@@ -302,8 +335,12 @@ engram:
   llm_base_url: http://localhost:11434
   token_budget: 12000
 
-  # Embedding model (local via Ollama)
+  # NL embedding model (local via Ollama)
   embedding_model: nomic-embed-text    # 768d, MTEB ~0.63
+
+  # Code embedding model (via sentence-transformers)
+  code_embedding_model: jinaai/jina-embeddings-v2-base-code  # 768d, 8k context
+  code_embedding_device: ""            # "" = auto (CUDA if available)
 
   # Cross-encoder reranking
   reranker_enabled: true
@@ -351,17 +388,18 @@ my-memory/
 git clone https://github.com/Relic-Studios/engram.git
 cd engram
 git checkout engram-code
-pip install -e ".[all,dev,ast]"
+pip install -e ".[all,dev]"
 
 # Run tests (skip consolidation — known slow tests)
 pytest tests/ --ignore=tests/test_consolidation.py -x -q --tb=short
-# 554 tests, ~2 minutes
+# 603 tests, ~2 minutes
 ```
 
 ### Test Suite
 
-554 tests across core systems:
+603 tests across core systems:
 
+- Dual embedding system: 49 tests
 - AST extraction engine: 62 tests
 - Symbol tokenizer: 40 tests
 - Symbol index + repo map: 33 tests
@@ -388,12 +426,12 @@ The `engram-code` branch follows a phased build plan. Completed work and remaini
 | Boot priming | SOUL.md philosophy, coding style, code-first classifier |
 | AST extraction | Multi-language structural analysis (Python, JS, TS) + repo map generation |
 | FTS5 tokenizer | Code-aware symbol splitting for compound identifiers |
+| Dual embeddings | Code-specific embedding model (jina-embeddings-v2-base-code) + NL model, dual-indexing, auto CUDA detection |
 
 ### Next
 
 | Item | Description |
 |------|-------------|
-| **Code-optimized embeddings** | Dual-embedding space (code model + NL model) running locally on GPU |
 | **Error fingerprinting** | Sentry-style SHA-256 fingerprints for error deduplication |
 | **Debugging session schema** | Structured error → investigation → resolution tracking |
 | **YAML procedural schemas** | Replace flat markdown skills with structured YAML + frontmatter matching |

@@ -1179,6 +1179,8 @@ def engram_debug_log(
         stack_trace: The stack trace (optional, for richer context).
         error_category: One of: logic, integration, performance, security, configuration.
     """
+    from engram.extraction.fingerprint import analyze_error
+
     system = _get_system()
 
     valid_categories = {
@@ -1190,6 +1192,13 @@ def engram_debug_log(
     }
     if error_category not in valid_categories:
         error_category = "logic"
+
+    # --- B1: Sentry-style error fingerprinting ---
+    analysis = analyze_error(error_message, stack_trace, error_category)
+    fingerprint = analysis["fingerprint"]
+
+    # Search for prior debug sessions with the same fingerprint
+    prior_sessions = _find_by_fingerprint(system, fingerprint)
 
     debug_content = (
         f"## Debug Session: {error_category}\n\n### Error\n{error_message}\n\n"
@@ -1203,15 +1212,55 @@ def engram_debug_log(
         kind="debug_session",
         tags=["debug", error_category],
         salience=0.75,
+        fingerprint=fingerprint,
+        exception_type=analysis["exception_type"],
+        message_template=analysis["message_template"],
+        app_frames=analysis["app_frames"],
     )
-    return json.dumps(
-        {
-            "trace_id": trace_id,
-            "kind": "debug_session",
-            "error_category": error_category,
-            "message": "Debug session logged — will be recalled for similar errors.",
-        }
-    )
+
+    result = {
+        "trace_id": trace_id,
+        "kind": "debug_session",
+        "error_category": error_category,
+        "fingerprint": fingerprint,
+        "exception_type": analysis["exception_type"],
+        "message_template": analysis["message_template"],
+        "app_frames": analysis["app_frames"],
+        "frame_count": analysis["frame_count"],
+        "message": "Debug session logged — will be recalled for similar errors.",
+    }
+    if prior_sessions:
+        result["prior_matches"] = len(prior_sessions)
+        result["prior_trace_ids"] = [s["id"] for s in prior_sessions[:5]]
+        result["message"] = (
+            f"Debug session logged. Found {len(prior_sessions)} prior "
+            f"session(s) with the same error fingerprint — check prior "
+            f"resolutions before reinventing the fix."
+        )
+    return json.dumps(result)
+
+
+def _find_by_fingerprint(
+    system: "MemorySystem",
+    fingerprint: str,
+    limit: int = 10,
+) -> list:
+    """Find prior debug_session traces with a matching fingerprint."""
+    try:
+        rows = system.episodic.conn.execute(
+            """
+            SELECT * FROM traces
+            WHERE kind = 'debug_session'
+              AND json_extract(metadata, '$.fingerprint') = ?
+            ORDER BY created DESC
+            LIMIT ?
+            """,
+            (fingerprint, limit),
+        ).fetchall()
+        return [system.episodic._row_to_dict(r) for r in rows]
+    except Exception:
+        # Metadata column may not exist in older schemas, degrade gracefully
+        return []
 
 
 @mcp.tool()
