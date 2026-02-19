@@ -1,24 +1,38 @@
 """
 engram.procedural.store — Procedural memory (skills & processes).
 
-Skills are stored as individual Markdown files in a directory.
-Search is keyword-based — no embeddings needed for the small
-number of skills a single identity typically accumulates.
+Skills are stored as individual Markdown files in a directory, with
+optional YAML frontmatter for structured metadata (language, framework,
+category, scope, confidence, etc.).
+
+Legacy skills (plain markdown without frontmatter) are fully supported.
+New skills written via ``add_structured_skill()`` include frontmatter.
+
+Search supports two modes:
+  - Keyword search (``search_skills``) — fast substring matching
+  - Multi-dimensional filter (``filter_skills``) — filter by language,
+    framework, category, scope, and tags from frontmatter metadata
 """
 
 from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
+
+from engram.procedural.schema import (
+    SkillMeta,
+    parse_frontmatter,
+    serialize_frontmatter,
+)
 
 
 class ProceduralStore:
     """Filesystem-backed store for procedural skills.
 
     Each skill is a ``.md`` file under ``skills_dir``.  The filename
-    (without extension) is the skill name; the first non-empty line is
-    treated as a short description.
+    (without extension) is the skill name; files may contain YAML
+    frontmatter for structured metadata.
     """
 
     def __init__(self, skills_dir: Path) -> None:
@@ -30,12 +44,24 @@ class ProceduralStore:
     # ------------------------------------------------------------------
 
     def list_skills(self) -> List[Dict]:
-        """Return all skills with ``name`` and ``description``."""
+        """Return all skills with metadata from frontmatter.
+
+        Each dict contains: ``name``, ``description``, ``path``, and
+        all frontmatter fields (language, framework, category, etc.).
+        Legacy files without frontmatter return default metadata.
+        """
         skills: List[Dict] = []
         for path in sorted(self.skills_dir.glob("*.md")):
-            name = path.stem
-            description = self._first_line(path)
-            skills.append({"name": name, "description": description, "path": str(path)})
+            meta, _body = self._parse_file(path)
+            # Fill in name from filename if not in frontmatter
+            if not meta.name:
+                meta.name = path.stem
+            # Fill description from first line if not in frontmatter
+            if not meta.description:
+                meta.description = self._first_line_from_body(_body)
+            entry = meta.to_dict()
+            entry["path"] = str(path)
+            skills.append(entry)
         return skills
 
     def get_skill(self, name: str) -> Optional[str]:
@@ -46,19 +72,133 @@ class ProceduralStore:
             return None
         return path.read_text(encoding="utf-8")
 
+    def get_skill_meta(self, name: str) -> Optional[SkillMeta]:
+        """Read a skill's metadata.  Returns ``None`` if not found."""
+        safe_name = self._sanitize_name(name)
+        path = self.skills_dir / f"{safe_name}.md"
+        if not path.exists():
+            return None
+        meta, _body = self._parse_file(path)
+        if not meta.name:
+            meta.name = path.stem
+        return meta
+
     def add_skill(self, name: str, content: str) -> None:
-        """Write (or overwrite) a skill file."""
+        """Write (or overwrite) a skill file.
+
+        Preserves existing frontmatter if present in ``content``.
+        For new structured skills, use ``add_structured_skill()``.
+        """
         safe_name = self._sanitize_name(name)
         path = self.skills_dir / f"{safe_name}.md"
         path.write_text(content, encoding="utf-8")
 
+    def add_structured_skill(
+        self,
+        name: str,
+        content: str,
+        language: str = "",
+        framework: str = "",
+        category: str = "",
+        scope: str = "global",
+        tags: Optional[List[str]] = None,
+        dependencies: Optional[List[str]] = None,
+        description: str = "",
+    ) -> SkillMeta:
+        """Write a skill with structured YAML frontmatter.
+
+        Creates the frontmatter automatically from the provided
+        metadata.  Returns the SkillMeta that was written.
+
+        Parameters
+        ----------
+        name:
+            Skill name (used as filename stem).
+        content:
+            Markdown body content (without frontmatter).
+        language, framework, category, scope:
+            Multi-dimensional filter metadata.
+        tags:
+            Tags for search and categorization.
+        dependencies:
+            Code dependencies required by this pattern.
+        description:
+            Short description.  If empty, extracted from first line.
+
+        Returns
+        -------
+        SkillMeta
+            The metadata that was written to the file.
+        """
+        safe_name = self._sanitize_name(name)
+
+        meta = SkillMeta(
+            name=name,
+            description=description or self._first_line_from_body(content),
+            language=language,
+            framework=framework,
+            category=category,
+            scope=scope,
+            tags=tags or [],
+            dependencies=dependencies or [],
+        )
+
+        # If the skill already exists, preserve confidence / counts
+        existing = self.get_skill_meta(name)
+        if existing:
+            meta.confidence = existing.confidence
+            meta.accepted_count = existing.accepted_count
+            meta.rejected_count = existing.rejected_count
+
+        full_content = serialize_frontmatter(meta, content)
+        path = self.skills_dir / f"{safe_name}.md"
+        path.write_text(full_content, encoding="utf-8")
+        return meta
+
+    def update_confidence(
+        self,
+        name: str,
+        accepted: bool = True,
+    ) -> Optional[SkillMeta]:
+        """Update a skill's confidence based on acceptance/rejection.
+
+        Increments ``accepted_count`` or ``rejected_count`` and
+        recalculates ``confidence`` as::
+
+            confidence = accepted / (accepted + rejected + 1)
+
+        The +1 is Laplace smoothing to avoid division by zero and
+        provide a Bayesian prior toward uncertainty.
+
+        Returns the updated SkillMeta, or None if the skill doesn't exist.
+        """
+        safe_name = self._sanitize_name(name)
+        path = self.skills_dir / f"{safe_name}.md"
+        if not path.exists():
+            return None
+
+        meta, body = self._parse_file(path)
+        if not meta.name:
+            meta.name = path.stem
+
+        if accepted:
+            meta.accepted_count += 1
+        else:
+            meta.rejected_count += 1
+
+        # Laplace-smoothed confidence
+        meta.confidence = round(
+            meta.accepted_count / (meta.accepted_count + meta.rejected_count + 1),
+            3,
+        )
+
+        full_content = serialize_frontmatter(meta, body)
+        path.write_text(full_content, encoding="utf-8")
+        return meta
+
     @staticmethod
     def _sanitize_name(name: str) -> str:
-        """Normalize a skill name to a safe, lowercase filename stem.
-
-        Strips whitespace, lowercases, replaces non-word chars with
-        underscores, and collapses consecutive underscores.
-        """
+        """Normalize a skill name to a safe, lowercase filename stem."""
         safe = re.sub(r"[^\w\-]", "_", name.strip().lower())
         safe = re.sub(r"_+", "_", safe).strip("_")
         return safe or "unnamed"
@@ -71,8 +211,8 @@ class ProceduralStore:
         """Keyword search across skill names and content.
 
         Returns matching skills sorted by relevance (number of keyword
-        hits, descending).  Each result includes ``name``,
-        ``description``, ``hits``, and ``path``.
+        hits, descending).  Each result includes metadata from
+        frontmatter plus ``hits`` and ``path``.
         """
         keywords = self._extract_keywords(query)
         if not keywords:
@@ -80,42 +220,79 @@ class ProceduralStore:
 
         results: List[Dict] = []
         for path in self.skills_dir.glob("*.md"):
-            name = path.stem
-            try:
-                content = path.read_text(encoding="utf-8").lower()
-            except OSError:
-                continue
+            meta, body = self._parse_file(path)
+            if not meta.name:
+                meta.name = path.stem
 
-            name_lower = name.lower()
-            searchable = name_lower + " " + content
+            # Search in name + body + metadata fields
+            searchable = " ".join(
+                [
+                    meta.name.lower(),
+                    meta.description.lower(),
+                    meta.language.lower(),
+                    meta.framework.lower(),
+                    meta.category.lower(),
+                    " ".join(meta.tags).lower(),
+                    body.lower(),
+                ]
+            )
             hits = sum(searchable.count(kw) for kw in keywords)
 
             if hits > 0:
-                results.append(
-                    {
-                        "name": name,
-                        "description": self._first_line(path),
-                        "hits": hits,
-                        "path": str(path),
-                    }
-                )
+                entry = meta.to_dict()
+                entry["hits"] = hits
+                entry["path"] = str(path)
+                results.append(entry)
 
         results.sort(key=lambda r: r["hits"], reverse=True)
+        return results
+
+    def filter_skills(
+        self,
+        language: str = "",
+        framework: str = "",
+        category: str = "",
+        scope: str = "",
+        tags: Optional[List[str]] = None,
+        min_confidence: float = 0.0,
+    ) -> List[Dict]:
+        """Multi-dimensional filter across skill frontmatter metadata.
+
+        Returns all skills matching ALL provided filter dimensions.
+        Empty filter values are wildcards (match anything).
+        Results sorted by confidence descending.
+        """
+        results: List[Dict] = []
+        for path in self.skills_dir.glob("*.md"):
+            meta, _body = self._parse_file(path)
+            if not meta.name:
+                meta.name = path.stem
+
+            if not meta.matches_filter(language, framework, category, scope, tags):
+                continue
+            if meta.confidence < min_confidence:
+                continue
+
+            entry = meta.to_dict()
+            entry["path"] = str(path)
+            results.append(entry)
+
+        results.sort(key=lambda r: r.get("confidence", 0), reverse=True)
         return results
 
     def match_context(self, message: str) -> List[str]:
         """Find skills relevant to a user message.
 
-        Simple heuristic: check whether any skill name or a keyword
-        from the skill's first line appears in the message.  Returns
-        the full content of each matching skill.
+        Checks skill name, description keywords, language, framework,
+        and tags against the message.  Returns the full file content
+        (including frontmatter) of each matching skill.
         """
         msg_lower = message.lower()
         matched: List[str] = []
 
         for path in self.skills_dir.glob("*.md"):
-            name_lower = path.stem.lower()
-            description_lower = self._first_line(path).lower()
+            meta, body = self._parse_file(path)
+            name_lower = (meta.name or path.stem).lower()
 
             # Match on skill name appearing in message
             if name_lower in msg_lower:
@@ -124,8 +301,33 @@ class ProceduralStore:
                     matched.append(content)
                 continue
 
-            # Match on description keywords
-            desc_keywords = self._extract_keywords(description_lower)
+            # Match on language or framework
+            if meta.language and meta.language.lower() in msg_lower:
+                content = self._safe_read(path)
+                if content is not None:
+                    matched.append(content)
+                continue
+
+            if meta.framework and meta.framework.lower() in msg_lower:
+                content = self._safe_read(path)
+                if content is not None:
+                    matched.append(content)
+                continue
+
+            # Match on tags
+            if meta.tags:
+                tag_match = any(
+                    t.lower() in msg_lower for t in meta.tags if len(t) >= 4
+                )
+                if tag_match:
+                    content = self._safe_read(path)
+                    if content is not None:
+                        matched.append(content)
+                    continue
+
+            # Match on description keywords (legacy behavior)
+            desc = meta.description or self._first_line_from_body(body)
+            desc_keywords = self._extract_keywords(desc.lower())
             for kw in desc_keywords:
                 if len(kw) >= 4 and kw in msg_lower:
                     content = self._safe_read(path)
@@ -140,16 +342,38 @@ class ProceduralStore:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _first_line(path: Path) -> str:
-        """Return the first non-empty, non-heading line as a description."""
+    def _parse_file(path: Path) -> tuple:
+        """Read a skill file and parse its frontmatter.
+
+        Returns (SkillMeta, body_str).  For legacy files without
+        frontmatter, returns (default SkillMeta, full_text).
+        """
         try:
-            with open(path, "r", encoding="utf-8") as fh:
-                for line in fh:
-                    stripped = line.strip().lstrip("# ").strip()
-                    if stripped:
-                        return stripped
+            text = path.read_text(encoding="utf-8")
         except OSError:
-            pass
+            return SkillMeta(), ""
+        return parse_frontmatter(text)
+
+    @staticmethod
+    def _first_line(path: Path) -> str:
+        """Return the first non-empty, non-heading line as a description.
+
+        For backward compatibility — reads raw file, skips frontmatter.
+        """
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            return ""
+        _, body = parse_frontmatter(text)
+        return ProceduralStore._first_line_from_body(body)
+
+    @staticmethod
+    def _first_line_from_body(body: str) -> str:
+        """Extract first non-empty, non-heading line from body text."""
+        for line in body.splitlines():
+            stripped = line.strip().lstrip("# ").strip()
+            if stripped:
+                return stripped
         return ""
 
     @staticmethod

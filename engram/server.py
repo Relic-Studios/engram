@@ -1085,6 +1085,8 @@ def engram_code_pattern(
     content: str = "",
     tags: str = "",
     language: str = "",
+    framework: str = "",
+    category: str = "",
 ) -> str:
     """Store or retrieve validated code patterns in procedural memory.
 
@@ -1098,6 +1100,8 @@ def engram_code_pattern(
         content: The pattern code/description (required for "store").
         tags: Comma-separated tags for categorization (e.g., "python,async,error-handling").
         language: Programming language (e.g., "python", "typescript").
+        framework: Framework or library (e.g., "asyncio", "react", "fastapi").
+        category: Pattern category (e.g., "error-handling", "testing", "api-design").
     """
     system = _get_system()
 
@@ -1105,23 +1109,27 @@ def engram_code_pattern(
         if not content:
             return json.dumps({"error": "content is required for action='store'"})
 
-        # Store as procedural skill
-        header = f"# {name}\n"
-        if language:
-            header += f"Language: {language}\n"
-        if tags:
-            header += f"Tags: {tags}\n"
-        header += "\n"
-        system.procedural.add_skill(name, header + content)
+        # Parse tags
+        tag_list = [t.strip() for t in tags.split(",") if t.strip()]
+
+        # Store as structured procedural skill with YAML frontmatter
+        meta = system.procedural.add_structured_skill(
+            name=name,
+            content=f"# {name}\n\n{content}",
+            language=language,
+            framework=framework,
+            category=category,
+            tags=tag_list,
+        )
 
         # Also log as episodic trace for search/retrieval
-        tag_list = [t.strip() for t in tags.split(",") if t.strip()]
+        ep_tags = list(tag_list)
         if language:
-            tag_list.append(language)
+            ep_tags.append(language)
         trace_id = system.episodic.log_trace(
             content=f"[Code Pattern: {name}] {content[:500]}",
             kind="code_pattern",
-            tags=tag_list,
+            tags=ep_tags,
             salience=0.8,
         )
 
@@ -1130,20 +1138,26 @@ def engram_code_pattern(
                 "action": "store",
                 "name": name,
                 "trace_id": trace_id,
-                "message": f"Pattern '{name}' stored in procedural + episodic memory.",
+                "language": language,
+                "framework": framework,
+                "category": category,
+                "confidence": meta.confidence,
+                "message": f"Pattern '{name}' stored with structured metadata.",
             }
         )
 
     elif action == "get":
         skill_content = system.procedural.get_skill(name)
         if skill_content:
-            return json.dumps(
-                {
-                    "action": "get",
-                    "name": name,
-                    "content": skill_content,
-                }
-            )
+            meta = system.procedural.get_skill_meta(name)
+            result: dict = {
+                "action": "get",
+                "name": name,
+                "content": skill_content,
+            }
+            if meta:
+                result["metadata"] = meta.to_dict()
+            return json.dumps(result)
         else:
             return json.dumps(
                 {
