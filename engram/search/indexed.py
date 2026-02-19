@@ -20,8 +20,14 @@ class IndexedSearch:
 
     def __init__(self, db_path: Path) -> None:
         self.db_path = Path(db_path)
-        self.conn = sqlite3.connect(str(self.db_path))
+        # check_same_thread=False: allows multi-agent HTTP mode where
+        # search requests may arrive on different threads.
+        self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+        # Match EpisodicStore's connection settings for consistency.
+        # WAL mode enables concurrent reads alongside EpisodicStore writes.
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA busy_timeout=5000")
 
     # ------------------------------------------------------------------
     # Public API

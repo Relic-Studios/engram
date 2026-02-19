@@ -54,6 +54,12 @@ Tools exposed (35 total):
         engram_get_rules     -- Get coding standards
         engram_add_wiring    -- Record code dependency relationship
         engram_project_init  -- Initialize project scope
+    AST / Code Analysis:
+        engram_extract_symbols -- AST analysis + optional symbol storage
+        engram_repo_map      -- Generate Aider-style repo map
+    Multi-Agent:
+        engram_sessions      -- List active client sessions
+        engram_register_client -- Register/identify an MCP client session
     Maintenance:
         engram_reindex       -- Rebuild search index
 """
@@ -63,7 +69,6 @@ import json
 import logging
 import os
 import traceback
-from pathlib import Path
 from typing import Any, Optional
 
 from mcp.server.fastmcp import FastMCP
@@ -1998,6 +2003,11 @@ def run_server(
         transport,
     )
     if transport in ("streamable-http", "sse"):
+        # Configure FastMCP's host/port settings for HTTP transports.
+        # These are read by run_sse_async() and run_streamable_http_async()
+        # when creating the uvicorn server.
+        mcp.settings.host = host
+        mcp.settings.port = port
         log.info("HTTP endpoint: http://%s:%d", host, port)
     try:
         mcp.run(transport=transport)  # type: ignore[arg-type]

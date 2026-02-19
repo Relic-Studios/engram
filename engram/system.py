@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from engram.core.config import Config
-from engram.core.types import AfterResult, Context, LLMFunc, MemoryStats, Signal
+from engram.core.types import AfterResult, Context, LLMFunc, MemoryStats
 from engram.working.allocator import reorder_u
 
 # Sentinel: distinguishes "never tried" from "tried and failed"
