@@ -302,6 +302,22 @@ def after(
             log.debug("Skill reinforcement failed: %s", exc)
         timings["skill_reinforcement"] = time.perf_counter() - _t0
 
+        # -- 6c. Automated ADR detection (C3) -----------------------------
+        #    Scan the response for architectural decisions (technology
+        #    choices, migration decisions, design trade-offs).  Detected
+        #    candidates are auto-logged as high-salience ADR traces so
+        #    they persist in the context window and prevent policy drift.
+        _t0 = time.perf_counter()
+        try:
+            adr_updates = _detect_and_log_adrs(
+                response=response,
+                episodic=episodic,
+            )
+            updates.extend(adr_updates)
+        except Exception as exc:
+            log.debug("ADR detection failed: %s", exc)
+        timings["adr_detection"] = time.perf_counter() - _t0
+
         # -- 7. Pressure-aware decay + compaction (MemGPT-inspired) --------
         _t0 = time.perf_counter()
         _run_maintenance(
@@ -624,6 +640,64 @@ def _extract_cited_trace_ids(response: str, trace_ids: List[str]) -> List[str]:
 
     # Map 1-indexed citation numbers to trace IDs
     return [trace_ids[n - 1] for n in sorted(cited_numbers)]
+
+
+def _detect_and_log_adrs(
+    *,
+    response: str,
+    episodic: "EpisodicStore",
+) -> List[Dict]:
+    """Detect architectural decisions in the response and auto-log them.
+
+    Uses heuristic pattern matching (no LLM call) to find design
+    choices, technology selections, and architectural trade-offs.
+    Detected ADRs are logged as high-salience ``architecture_decision``
+    traces so they persist in the context window.
+
+    Returns a list of update dicts for the AfterResult.
+    """
+    from engram.pipeline.adr_detector import detect_adr_candidates
+
+    candidates = detect_adr_candidates(response)
+    if not candidates:
+        return []
+
+    updates: List[Dict] = []
+    for candidate in candidates:
+        # Build ADR content in Nygard format
+        adr_content = f"## Architecture Decision (auto-detected)\n\n"
+        if candidate.context:
+            adr_content += f"### Context\n{candidate.context}\n\n"
+        if candidate.options:
+            adr_content += f"### Options Considered\n{candidate.options}\n\n"
+        adr_content += f"### Decision\n{candidate.decision}\n\n"
+        if candidate.consequences:
+            adr_content += f"### Consequences\n{candidate.consequences}\n"
+
+        trace_id = episodic.log_trace(
+            content=adr_content,
+            kind="architecture_decision",
+            tags=["adr", "auto-detected"],
+            salience=0.90,  # High but slightly below manual ADRs (0.95)
+            detection_confidence=candidate.confidence,
+            auto_detected=True,
+        )
+
+        updates.append(
+            {
+                "type": "auto_adr",
+                "trace_id": trace_id,
+                "decision": candidate.decision[:100],
+                "confidence": candidate.confidence,
+            }
+        )
+        log.info(
+            "Auto-detected ADR (confidence=%.2f): %s",
+            candidate.confidence,
+            candidate.decision[:80],
+        )
+
+    return updates
 
 
 def _extract_and_apply(
