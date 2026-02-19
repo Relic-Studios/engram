@@ -24,6 +24,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from engram.core.config import Config
 from engram.core.types import AfterResult, Context, LLMFunc, MemoryStats, Signal
+from engram.working.allocator import reorder_u
 
 # Sentinel: distinguishes "never tried" from "tried and failed"
 _NOT_SET = object()
@@ -464,9 +465,13 @@ class MemorySystem:
         adrs = self.episodic.get_traces_by_kind(
             "architecture_decision", limit=5, min_salience=0.3
         )
+        # Primacy-recency: most important ADRs at start and end
+        adrs = reorder_u(adrs, key_field="salience")
 
         # --- High-salience traces (code patterns, debug sessions, etc) ---
         top_traces = self.episodic.get_by_salience(limit=10)
+        # Primacy-recency: highest-salience traces at start and end
+        top_traces = reorder_u(top_traces, key_field="salience")
 
         # --- Coding style preferences ---
         prefs = self.semantic.get_preferences()

@@ -70,6 +70,7 @@ from mcp.server.fastmcp import FastMCP
 
 from engram.core.config import Config
 from engram.system import MemorySystem
+from engram.working.allocator import reorder_u
 
 log = logging.getLogger("engram.server")
 
@@ -307,6 +308,9 @@ def engram_search(
     limit = max(1, min(limit, 100))
     system = _get_system()
     results = system.search(query=query, person=person or None, limit=limit)
+    # Primacy-recency reordering: place highest-relevance results at
+    # the start and end of the list so the LLM attends to them most.
+    results = reorder_u(results, key_field="combined_score")
     return json.dumps(results, indent=2, default=str)
 
 
@@ -794,6 +798,11 @@ def engram_reflect(
             log.warning("Consolidation during reflection failed: %s", exc)
 
     # Build reflection summary
+    top_reflect = sorted(all_traces, key=lambda x: x.get("salience", 0), reverse=True)[
+        :15
+    ]
+    # Primacy-recency reordering for LLM attention
+    top_reflect = reorder_u(top_reflect, key_field="salience")
     reflection = {
         "topic": topic,
         "person": canonical or "",
@@ -806,9 +815,7 @@ def engram_reflect(
                 "content": t.get("content", "")[:300],
                 "salience": t.get("salience", 0.0),
             }
-            for t in sorted(
-                all_traces, key=lambda x: x.get("salience", 0), reverse=True
-            )[:15]
+            for t in top_reflect
         ],
     }
 
