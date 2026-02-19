@@ -650,3 +650,263 @@ class TestEngramCorrect:
         new_trace = server_system.episodic.get_trace(data["new_trace_id"])
         assert "alice" in new_trace["tags"]
         assert "cats" in new_trace["tags"]
+
+
+# ===========================================================================
+# Debug Log — Table 3 Schema (B1 + B2)
+# ===========================================================================
+
+
+class TestEngramDebugLog:
+    """Tests for engram_debug_log with full Table 3 schema."""
+
+    def test_returns_valid_json(self, server_system):
+        result = server_mod.engram_debug_log(
+            error_message="TypeError: bad operand",
+            resolution="Fixed type coercion",
+        )
+        data = json.loads(result)
+        assert data["kind"] == "debug_session"
+
+    def test_fingerprint_in_response(self, server_system):
+        result = server_mod.engram_debug_log(
+            error_message="ImportError: no module 'foo'",
+            resolution="Installed missing package",
+        )
+        data = json.loads(result)
+        assert "fingerprint" in data
+        assert len(data["fingerprint"]) == 64  # SHA-256 hex
+
+    def test_exception_type_extracted(self, server_system):
+        result = server_mod.engram_debug_log(
+            error_message="ValueError: invalid literal",
+            resolution="Validated input",
+        )
+        data = json.loads(result)
+        assert data["exception_type"] == "ValueError"
+
+    def test_category_validated(self, server_system):
+        result = server_mod.engram_debug_log(
+            error_message="Error",
+            resolution="Fix",
+            error_category="bogus_category",
+        )
+        data = json.loads(result)
+        assert data["error_category"] == "logic"  # falls back to default
+
+    def test_resolution_strategy_stored(self, server_system):
+        result = server_mod.engram_debug_log(
+            error_message="TimeoutError: connection timed out",
+            resolution="Added exponential backoff to HTTP client",
+            resolution_strategy="Retry with exponential backoff",
+        )
+        data = json.loads(result)
+        assert data["resolution_strategy"] == "Retry with exponential backoff"
+
+        # Verify it's in the trace metadata
+        trace = server_system.episodic.get_trace(data["trace_id"])
+        meta = (
+            json.loads(trace["metadata"])
+            if isinstance(trace["metadata"], str)
+            else trace["metadata"]
+        )
+        assert meta["resolution_strategy"] == "Retry with exponential backoff"
+
+    def test_attempt_history_stored(self, server_system):
+        attempts = json.dumps(
+            [
+                {
+                    "approach": "Increase timeout to 60s",
+                    "rejected": "Masks the real issue",
+                },
+                {
+                    "approach": "Add connection pooling",
+                    "rejected": "Not the bottleneck",
+                },
+            ]
+        )
+        result = server_mod.engram_debug_log(
+            error_message="TimeoutError: connection timed out",
+            resolution="Added retry with backoff",
+            attempt_history=attempts,
+        )
+        data = json.loads(result)
+        trace = server_system.episodic.get_trace(data["trace_id"])
+        meta = (
+            json.loads(trace["metadata"])
+            if isinstance(trace["metadata"], str)
+            else trace["metadata"]
+        )
+        assert meta["attempt_history"] == attempts
+
+    def test_associated_adr_stored(self, server_system):
+        # Create an ADR first
+        adr_result = server_mod.engram_architecture_decision(
+            context="Need retry strategy",
+            options="1. Simple retry 2. Exponential backoff 3. Circuit breaker",
+            decision="Exponential backoff with jitter",
+        )
+        adr_data = json.loads(adr_result)
+        adr_id = adr_data["trace_id"]
+
+        # Log debug session linked to the ADR
+        result = server_mod.engram_debug_log(
+            error_message="ConnectionError: server refused",
+            resolution="Implemented backoff per ADR",
+            associated_adr=adr_id,
+        )
+        data = json.loads(result)
+        assert data["associated_adr"] == adr_id
+
+        # Verify in trace metadata
+        trace = server_system.episodic.get_trace(data["trace_id"])
+        meta = (
+            json.loads(trace["metadata"])
+            if isinstance(trace["metadata"], str)
+            else trace["metadata"]
+        )
+        assert meta["associated_adr"] == adr_id
+
+    def test_content_includes_attempt_history(self, server_system):
+        result = server_mod.engram_debug_log(
+            error_message="RuntimeError: deadlock",
+            resolution="Reordered lock acquisition",
+            attempt_history="Tried adding a timeout — masked the issue.",
+        )
+        data = json.loads(result)
+        trace = server_system.episodic.get_trace(data["trace_id"])
+        assert "Attempt History" in trace["content"]
+        assert "timeout" in trace["content"]
+
+    def test_content_includes_resolution_strategy(self, server_system):
+        result = server_mod.engram_debug_log(
+            error_message="RuntimeError: deadlock",
+            resolution="Reordered lock acquisition to prevent cycle",
+            resolution_strategy="Lock ordering discipline",
+        )
+        data = json.loads(result)
+        trace = server_system.episodic.get_trace(data["trace_id"])
+        assert "Resolution Strategy" in trace["content"]
+        assert "Lock ordering discipline" in trace["content"]
+
+    def test_fingerprint_matches_prior(self, server_system):
+        """Logging the same error twice should detect the prior session."""
+        msg = "TypeError: cannot add 'int' and 'str'"
+        server_mod.engram_debug_log(error_message=msg, resolution="Added type cast")
+        # Log same error again
+        result = server_mod.engram_debug_log(
+            error_message=msg, resolution="Used str() conversion"
+        )
+        data = json.loads(result)
+        assert data.get("prior_matches", 0) >= 1
+
+    def test_all_table3_fields_minimal(self, server_system):
+        """All Table 3 fields can be provided together."""
+        result = server_mod.engram_debug_log(
+            error_message="KeyError: 'config'",
+            resolution="Added default config fallback",
+            stack_trace='  File "/app/main.py", line 10, in load\n    cfg["config"]\n',
+            error_category="configuration",
+            resolution_strategy="Provide sensible defaults",
+            attempt_history="Tried env var lookup — not portable",
+            associated_adr="adr-123",
+        )
+        data = json.loads(result)
+        assert data["error_category"] == "configuration"
+        assert data["fingerprint"]
+        assert data["resolution_strategy"] == "Provide sensible defaults"
+        assert data["associated_adr"] == "adr-123"
+
+
+# ===========================================================================
+# Debug Recall (B2)
+# ===========================================================================
+
+
+class TestEngramDebugRecall:
+    """Tests for engram_debug_recall — querying debug sessions."""
+
+    def _log_debug(self, msg="TypeError: bad", resolution="Fixed it", **kwargs):
+        """Helper to log a debug session and return parsed result."""
+        result = server_mod.engram_debug_log(
+            error_message=msg, resolution=resolution, **kwargs
+        )
+        return json.loads(result)
+
+    def test_recall_by_fingerprint(self, server_system):
+        logged = self._log_debug()
+        fp = logged["fingerprint"]
+
+        result = server_mod.engram_debug_recall(fingerprint=fp)
+        data = json.loads(result)
+        assert data["matches"] >= 1
+        assert any(s["trace_id"] == logged["trace_id"] for s in data["sessions"])
+
+    def test_recall_by_error_message(self, server_system):
+        self._log_debug(msg="ImportError: no module named 'requests'")
+
+        result = server_mod.engram_debug_recall(
+            error_message="ImportError: no module named 'requests'"
+        )
+        data = json.loads(result)
+        assert data["matches"] >= 1
+
+    def test_recall_by_category(self, server_system):
+        self._log_debug(
+            msg="Slow query: 5000ms",
+            resolution="Added index",
+            error_category="performance",
+        )
+
+        result = server_mod.engram_debug_recall(error_category="performance")
+        data = json.loads(result)
+        assert data["matches"] >= 1
+        # All results should be debug_sessions (category filter)
+        for s in data["sessions"]:
+            assert s["content_preview"]  # has content
+
+    def test_recall_no_matches(self, server_system):
+        result = server_mod.engram_debug_recall(
+            fingerprint="0" * 64  # nonexistent fingerprint
+        )
+        data = json.loads(result)
+        assert data["matches"] == 0
+        assert data["sessions"] == []
+
+    def test_recall_returns_metadata(self, server_system):
+        self._log_debug(
+            msg="ConnectionError: refused",
+            resolution="Added retry",
+            resolution_strategy="Exponential backoff",
+            attempt_history="Tried increasing timeout",
+            associated_adr="adr-456",
+        )
+
+        result = server_mod.engram_debug_recall(
+            error_message="ConnectionError: refused"
+        )
+        data = json.loads(result)
+        assert data["matches"] >= 1
+        session = data["sessions"][0]
+        assert session["resolution_strategy"] == "Exponential backoff"
+        assert session["attempt_history"] == "Tried increasing timeout"
+        assert session["associated_adr"] == "adr-456"
+
+    def test_recall_no_params_returns_empty(self, server_system):
+        """Calling with no params should return empty (no browse-all)."""
+        result = server_mod.engram_debug_recall()
+        data = json.loads(result)
+        assert data["matches"] == 0
+
+    def test_recall_limit_respected(self, server_system):
+        # Log 3 identical errors
+        for i in range(3):
+            server_mod.engram_debug_log(
+                error_message=f"RuntimeError: fail #{i}",
+                resolution=f"Fix #{i}",
+                error_category="logic",
+            )
+
+        result = server_mod.engram_debug_recall(error_category="logic", limit=2)
+        data = json.loads(result)
+        assert len(data["sessions"]) <= 2

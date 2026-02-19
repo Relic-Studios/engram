@@ -14,7 +14,7 @@ Or configure in your MCP client (OpenCode, OpenClaw, etc.) as:
         }
     }
 
-Tools exposed (30 total):
+Tools exposed (33 total):
     Core Pipeline:
         engram_before        -- Pre-LLM context injection
         engram_after         -- Post-LLM logging + learning
@@ -49,7 +49,8 @@ Tools exposed (30 total):
     Code-First (Phase 4):
         engram_architecture_decision -- Record an ADR
         engram_code_pattern  -- Store/get reusable code patterns
-        engram_debug_log     -- Log error + resolution
+        engram_debug_log     -- Log error + resolution (Table 3 schema)
+        engram_debug_recall  -- Recall prior debug sessions by fingerprint
         engram_get_rules     -- Get coding standards
         engram_add_wiring    -- Record code dependency relationship
         engram_project_init  -- Initialize project scope
@@ -1166,6 +1167,9 @@ def engram_debug_log(
     resolution: str,
     stack_trace: str = "",
     error_category: str = "logic",
+    resolution_strategy: str = "",
+    attempt_history: str = "",
+    associated_adr: str = "",
 ) -> str:
     """Record a debugging episode with error and resolution.
 
@@ -1173,11 +1177,25 @@ def engram_debug_log(
     to recall resolution strategies for similar future failures.
     Error fingerprinting groups semantically similar issues.
 
+    Implements Table 3 (Episodic Debugging Memory schema) from the
+    buildplan: fingerprint_id, error_category, attempt_history,
+    resolution_strategy, associated_adr.
+
     Args:
         error_message: The error message or description of the problem.
         resolution: How the error was resolved (description + key changes).
         stack_trace: The stack trace (optional, for richer context).
         error_category: One of: logic, integration, performance, security, configuration.
+        resolution_strategy: High-level summary of the fix approach
+            (e.g., "Implement lazy loading", "Add retry with backoff").
+            Distinct from the detailed resolution — this is the reusable
+            *pattern* that solved the problem.
+        attempt_history: JSON string or prose describing failed approaches
+            before the successful fix.  Records what was tried and why
+            it was rejected, so the agent avoids repeating dead ends.
+        associated_adr: Trace ID of a related Architecture Decision Record.
+            Links the debug session to the design decision that caused or
+            resolved the issue.
     """
     from engram.extraction.fingerprint import analyze_error
 
@@ -1200,22 +1218,39 @@ def engram_debug_log(
     # Search for prior debug sessions with the same fingerprint
     prior_sessions = _find_by_fingerprint(system, fingerprint)
 
+    # --- Build structured debug content ---
     debug_content = (
         f"## Debug Session: {error_category}\n\n### Error\n{error_message}\n\n"
     )
     if stack_trace:
         debug_content += f"### Stack Trace\n```\n{stack_trace}\n```\n\n"
+    if attempt_history:
+        debug_content += f"### Attempt History\n{attempt_history}\n\n"
     debug_content += f"### Resolution\n{resolution}\n"
+    if resolution_strategy:
+        debug_content += f"\n### Resolution Strategy\n{resolution_strategy}\n"
+
+    # --- Build metadata (Table 3 schema) ---
+    trace_metadata = {
+        "fingerprint": fingerprint,
+        "exception_type": analysis["exception_type"],
+        "message_template": analysis["message_template"],
+        "app_frames": analysis["app_frames"],
+    }
+    if resolution_strategy:
+        trace_metadata["resolution_strategy"] = resolution_strategy
+    if attempt_history:
+        # Store attempt_history as-is — could be JSON or prose
+        trace_metadata["attempt_history"] = attempt_history
+    if associated_adr:
+        trace_metadata["associated_adr"] = associated_adr
 
     trace_id = system.episodic.log_trace(
         content=debug_content,
         kind="debug_session",
         tags=["debug", error_category],
         salience=0.75,
-        fingerprint=fingerprint,
-        exception_type=analysis["exception_type"],
-        message_template=analysis["message_template"],
-        app_frames=analysis["app_frames"],
+        **trace_metadata,
     )
 
     result = {
@@ -1229,6 +1264,10 @@ def engram_debug_log(
         "frame_count": analysis["frame_count"],
         "message": "Debug session logged — will be recalled for similar errors.",
     }
+    if resolution_strategy:
+        result["resolution_strategy"] = resolution_strategy
+    if associated_adr:
+        result["associated_adr"] = associated_adr
     if prior_sessions:
         result["prior_matches"] = len(prior_sessions)
         result["prior_trace_ids"] = [s["id"] for s in prior_sessions[:5]]
@@ -1238,6 +1277,144 @@ def engram_debug_log(
             f"resolutions before reinventing the fix."
         )
     return json.dumps(result)
+
+
+@mcp.tool()
+@_safe_json
+def engram_debug_recall(
+    fingerprint: str = "",
+    error_message: str = "",
+    error_category: str = "",
+    limit: int = 10,
+) -> str:
+    """Recall prior debug sessions by fingerprint or error pattern.
+
+    Use this BEFORE attempting a fix to check if the same (or similar)
+    error has been resolved before.  Returns matching debug sessions
+    with their resolutions, strategies, and attempt histories.
+
+    Lookup modes (use one):
+      - fingerprint: Exact fingerprint match (fastest, most precise).
+      - error_message: Computes the fingerprint from the message and
+        searches by that.  Also falls back to FTS text search.
+      - error_category: Browse all debug sessions in a category.
+
+    Args:
+        fingerprint: Exact SHA-256 fingerprint to look up.
+        error_message: Error message to fingerprint and search for.
+        error_category: Filter by category (logic, integration, etc.).
+        limit: Maximum results to return (default 10).
+    """
+    system = _get_system()
+    results = []
+
+    # Mode 1: Exact fingerprint lookup
+    if fingerprint:
+        results = _find_by_fingerprint(system, fingerprint, limit)
+
+    # Mode 2: Compute fingerprint from error message, then lookup + FTS fallback
+    elif error_message:
+        from engram.extraction.fingerprint import compute_fingerprint as _fp
+
+        # Try fingerprint with category if provided, then all categories
+        # (since we don't know which category was used at log time).
+        categories_to_try = []
+        if error_category:
+            categories_to_try.append(error_category)
+        categories_to_try.extend(
+            [
+                "logic",
+                "integration",
+                "performance",
+                "security",
+                "configuration",
+            ]
+        )
+        # Deduplicate while preserving order
+        seen = set()
+        for cat in categories_to_try:
+            if cat in seen:
+                continue
+            seen.add(cat)
+            computed_fp = _fp(error_message, "", cat)
+            results = _find_by_fingerprint(system, computed_fp, limit)
+            if results:
+                break
+
+        # Also try without category (bare fingerprint)
+        if not results:
+            computed_fp = _fp(error_message)
+            results = _find_by_fingerprint(system, computed_fp, limit)
+
+        # FTS fallback if fingerprint match found nothing
+        if not results:
+            try:
+                results = system.episodic.search_traces(error_message, limit=limit)
+                # Filter to debug_session kind only
+                results = [r for r in results if r.get("kind") == "debug_session"]
+            except Exception:
+                pass
+
+    # Mode 3: Browse by category
+    elif error_category:
+        try:
+            rows = system.episodic.conn.execute(
+                """
+                SELECT * FROM traces
+                WHERE kind = 'debug_session'
+                  AND json_extract(tags, '$') LIKE ?
+                ORDER BY created DESC
+                LIMIT ?
+                """,
+                (f'%"{error_category}"%', limit),
+            ).fetchall()
+            results = [system.episodic._row_to_dict(r) for r in rows]
+        except Exception:
+            pass
+
+    if not results:
+        return json.dumps(
+            {
+                "matches": 0,
+                "sessions": [],
+                "message": "No matching debug sessions found.",
+            }
+        )
+
+    # Format results — extract key fields from metadata
+    sessions = []
+    for r in results[:limit]:
+        meta = {}
+        if r.get("metadata"):
+            try:
+                meta = (
+                    json.loads(r["metadata"])
+                    if isinstance(r["metadata"], str)
+                    else r["metadata"]
+                )
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        session = {
+            "trace_id": r.get("id", ""),
+            "created": r.get("created", ""),
+            "error_category": meta.get("error_category", ""),
+            "fingerprint": meta.get("fingerprint", ""),
+            "exception_type": meta.get("exception_type", ""),
+            "resolution_strategy": meta.get("resolution_strategy", ""),
+            "attempt_history": meta.get("attempt_history", ""),
+            "associated_adr": meta.get("associated_adr", ""),
+            "content_preview": (r.get("content", ""))[:500],
+        }
+        sessions.append(session)
+
+    return json.dumps(
+        {
+            "matches": len(sessions),
+            "sessions": sessions,
+            "message": f"Found {len(sessions)} matching debug session(s).",
+        }
+    )
 
 
 def _find_by_fingerprint(
