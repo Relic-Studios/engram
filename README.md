@@ -435,4 +435,4 @@ MIT License. See [LICENSE](LICENSE).
 
 ## Author
 
-**[Aidan Poole](https://github.com/AidanPoole)** / [Relic Studios](https://github.com/Relic-Studios)
+**[Aidan Poole](https://relicstudios.xyz/aidan-poole.html)** / [Relic Studios](https://github.com/Relic-Studios)
